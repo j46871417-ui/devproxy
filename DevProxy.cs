@@ -354,23 +354,69 @@ namespace DevProxy
             Console.Write("  [?] Проверка соединения через прокси... ");
             try
             {
-                HttpWebRequest req = (HttpWebRequest)WebRequest.Create("https://www.google.com");
-                req.Timeout = 6000;
-                req.Proxy = new WebProxy(proxyUrl);
-                using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+                ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072; // TLS 1.2
+
+                Uri proxyUri = new Uri(proxyUrl);
+                WebProxy proxy = new WebProxy(proxyUri.Host, proxyUri.Port);
+                if (!string.IsNullOrEmpty(proxyUri.UserInfo))
                 {
-                    if ((int)resp.StatusCode >= 200 && (int)resp.StatusCode < 400)
+                    string[] userPass = proxyUri.UserInfo.Split(':');
+                    string user = Uri.UnescapeDataString(userPass[0]);
+                    string pass = userPass.Length > 1 ? Uri.UnescapeDataString(userPass[1]) : "";
+                    proxy.Credentials = new NetworkCredential(user, pass);
+                }
+
+                string[] testEndpoints = new string[]
+                {
+                    "https://generativelanguage.googleapis.com",
+                    "https://www.google.com"
+                };
+
+                bool ok = false;
+                string lastError = "";
+
+                foreach (string endpoint in testEndpoints)
+                {
+                    try
                     {
-                        Console.ForegroundColor = ConsoleColor.Green;
-                        Console.WriteLine("УСПЕХ! Прокси работает корректно.");
-                        Console.ResetColor();
+                        HttpWebRequest req = (HttpWebRequest)WebRequest.Create(endpoint);
+                        req.Timeout = 7000;
+                        req.Proxy = proxy;
+                        req.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)";
+
+                        using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+                        {
+                            ok = true;
+                            break;
+                        }
                     }
-                    else
+                    catch (WebException wex)
                     {
-                        Console.ForegroundColor = ConsoleColor.Yellow;
-                        Console.WriteLine("Код ответа: " + resp.StatusCode);
-                        Console.ResetColor();
+                        HttpWebResponse resp = wex.Response as HttpWebResponse;
+                        if (resp != null)
+                        {
+                            int code = (int)resp.StatusCode;
+                            if (code == 200 || code == 404 || code == 400)
+                            {
+                                ok = true;
+                                break;
+                            }
+                        }
+                        lastError = wex.Message;
                     }
+                }
+
+                if (ok)
+                {
+                    Console.ForegroundColor = ConsoleColor.Green;
+                    Console.WriteLine("УСПЕХ! Прокси работает корректно.");
+                    Console.ResetColor();
+                }
+                else
+                {
+                    Console.ForegroundColor = ConsoleColor.Yellow;
+                    Console.WriteLine("ПРЕДУПРЕЖДЕНИЕ: " + lastError);
+                    Console.ResetColor();
                 }
             }
             catch (Exception ex)

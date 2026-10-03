@@ -253,20 +253,31 @@ def apply_proxy(proxy_url: str):
 
 def test_proxy_connection(proxy_url: str):
     print(f"  {Colors.CYAN}?{Colors.RESET} Проверка связи через прокси...", end="", flush=True)
-    try:
-        proxy_handler = urllib.request.ProxyHandler({
-            'http': proxy_url,
-            'https': proxy_url
-        })
-        opener = urllib.request.build_opener(proxy_handler)
-        req = urllib.request.Request("https://www.google.com", headers={"User-Agent": "Mozilla/5.0"})
-        with opener.open(req, timeout=7) as resp:
-            if resp.status < 400:
+    proxy_handler = urllib.request.ProxyHandler({
+        'http': proxy_url,
+        'https': proxy_url
+    })
+    opener = urllib.request.build_opener(proxy_handler)
+
+    test_endpoints = [
+        "https://generativelanguage.googleapis.com",
+        "https://www.google.com"
+    ]
+
+    for ep in test_endpoints:
+        try:
+            req = urllib.request.Request(ep, headers={"User-Agent": "Mozilla/5.0"})
+            with opener.open(req, timeout=7) as resp:
                 print(f" {Colors.GREEN}УСПЕШНО! (Код {resp.status}){Colors.RESET}")
-            else:
-                print(f" {Colors.YELLOW}Ответ: {resp.status}{Colors.RESET}")
-    except Exception as e:
-        print(f" {Colors.YELLOW}Внимание: Не удалось выполнить тестовый запрос ({e}){Colors.RESET}")
+                return
+        except urllib.error.HTTPError as he:
+            if he.code in (200, 404, 400):
+                print(f" {Colors.GREEN}УСПЕШНО! Соединение установлено (HTTP {he.code}){Colors.RESET}")
+                return
+        except Exception:
+            pass
+
+    print(f" {Colors.YELLOW}Внимание: Прокси требует специального шлюза или хост ограничен.{Colors.RESET}")
 
 def remove_proxy():
     print(f"\n{Colors.YELLOW}[-] Сброс и удаление настроек прокси...{Colors.RESET}")
