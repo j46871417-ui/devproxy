@@ -2,6 +2,7 @@
 *.bak
 *.pdb
 *.tmp
+*.tar.gz
 
 # Python
 __pycache__/

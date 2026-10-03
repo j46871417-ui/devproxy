@@ -236,6 +236,36 @@ def apply_proxy(proxy_url: str):
             print(f"  {Colors.GREEN}✓{Colors.RESET} {'Windows Env':16}: системные переменные пользователя установлены (setx)")
         except Exception as e:
             print(f"  {Colors.YELLOW}!{Colors.RESET} Windows Env: {e}")
+    else:
+        # Linux & macOS shell environment
+        rc_files = [os.path.expanduser("~/.bashrc"), os.path.expanduser("~/.zshrc"), os.path.expanduser("~/.profile")]
+        block = (
+            "\n# >>> devproxy proxy configuration >>>\n"
+            f'export http_proxy="{proxy_url}"\n'
+            f'export https_proxy="{proxy_url}"\n'
+            f'export all_proxy="{proxy_url}"\n'
+            f'export HTTP_PROXY="{proxy_url}"\n'
+            f'export HTTPS_PROXY="{proxy_url}"\n'
+            f'export ALL_PROXY="{proxy_url}"\n'
+            'export no_proxy="localhost,127.0.0.1,::1"\n'
+            'export NO_PROXY="localhost,127.0.0.1,::1"\n'
+            "# <<< devproxy proxy configuration <<<\n"
+        )
+        for rc in rc_files:
+            if os.path.exists(rc) or rc.endswith(".bashrc"):
+                try:
+                    content = ""
+                    if os.path.exists(rc):
+                        with open(rc, "r", encoding="utf-8") as f:
+                            content = f.read()
+                    content = re.sub(r'# >>> devproxy proxy configuration >>>.*?# <<< devproxy proxy configuration <<<\n?', '', content, flags=re.DOTALL)
+                    with open(rc, "w", encoding="utf-8") as f:
+                        f.write(content.rstrip() + "\n" + block)
+                except Exception:
+                    pass
+        for v in ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]:
+            os.environ[v] = proxy_url
+        print(f"  {Colors.GREEN}✓{Colors.RESET} {'Linux Shell':16}: переменные прокси добавлены в ~/.bashrc / ~/.zshrc")
 
     # 3. Update Git global configuration
     try:
@@ -313,6 +343,20 @@ def remove_proxy():
             print(f"  {Colors.GREEN}✓{Colors.RESET} {'Windows Env':16}: переменные пользователя удалены")
         except Exception:
             pass
+    else:
+        # Linux & macOS
+        rc_files = [os.path.expanduser("~/.bashrc"), os.path.expanduser("~/.zshrc"), os.path.expanduser("~/.profile")]
+        for rc in rc_files:
+            if os.path.exists(rc):
+                try:
+                    with open(rc, "r", encoding="utf-8") as f:
+                        content = f.read()
+                    cleaned = re.sub(r'# >>> devproxy proxy configuration >>>.*?# <<< devproxy proxy configuration <<<\n?', '', content, flags=re.DOTALL)
+                    with open(rc, "w", encoding="utf-8") as f:
+                        f.write(cleaned)
+                except Exception:
+                    pass
+        print(f"  {Colors.GREEN}✓{Colors.RESET} {'Linux Shell':16}: переменные удалены из ~/.bashrc / ~/.zshrc")
 
     try:
         subprocess.run(["git", "config", "--global", "--unset", "http.proxy"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
