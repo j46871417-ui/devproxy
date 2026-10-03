@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-IDE Proxy Injector v1.0.0
+DevProxy CLI v1.0.0
 Universal proxy configuration tool for Cursor, VS Code, Windsurf, VSCodium, Terminals & Git.
 """
 
@@ -189,7 +189,6 @@ def read_json_settings(path: str) -> dict:
         with open(path, "r", encoding="utf-8") as f:
             raw = f.read()
         cleaned = strip_json_comments(raw)
-        # Remove trailing commas
         cleaned = re.sub(r',\s*([\}\]])', r'\1', cleaned)
         return json.loads(cleaned)
     except Exception:
@@ -343,11 +342,11 @@ def main():
             show_status()
             return
         elif arg in ("--help", "-h", "help"):
-            print("IDE Proxy Injector v1.0.0")
+            print("DevProxy CLI v1.0.0")
             print("Использование:")
-            print("  python ide_proxy_injector.py [ПРОКСИ]")
-            print("  python ide_proxy_injector.py --status")
-            print("  python ide_proxy_injector.py --remove")
+            print("  python devproxy.py [ПРОКСИ]")
+            print("  python devproxy.py --status")
+            print("  python devproxy.py --remove")
             return
         else:
             norm = normalize_proxy_string(arg)
@@ -358,7 +357,7 @@ def main():
     while True:
         print(f"{Colors.CYAN}{Colors.BOLD}")
         print("============================================================")
-        print("  [+] IDE PROXY INJECTOR v1.0.0")
+        print("  [+] DevProxy CLI v1.0.0")
         print("      Универсальная настройка Cursor, VS Code, Windsurf, Git")
         print("============================================================")
         print(f"{Colors.RESET}")

@@ -1,8 +1,8 @@
-# IDE Proxy Injector ⚡
+# DevProxy CLI ⚡
 
 > **Универсальная легковесная утилита для автоматического внедрения и переключения прокси во всех средах разработки (Cursor, VS Code, Windsurf, VSCodium), Git и системном терминале в один клик.**
 
-[![Release](https://img.shields.io/badge/Release-v1.0.0-blue.svg)](https://github.com/j46871417-ui/ide-proxy-injector/releases)
+[![Release](https://img.shields.io/badge/Release-v1.0.0-blue.svg)](https://github.com/j46871417-ui/devproxy/releases)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-brightgreen.svg)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -10,12 +10,12 @@
 
 ## 🎯 Зачем это нужно?
 
-При работе с AI-ассистентами в современных IDE (Cursor, VS Code, Windsurf), а также при работе через VPN или корпоративные сети часто требуется прокси.
-Ручная правка `settings.json`, системных переменных среды `HTTP_PROXY`/`HTTPS_PROXY` и конфигурации Git в разных местах отнимает время, приводит к синтаксическим ошибкам и сбитым комментариям в JSONC.
+При разработке с AI-ассистентами в современных IDE (Cursor, VS Code, Windsurf), а также при работе через VPN или корпоративные шлюзы разработчикам регулярно требуется прокси.
+Ручная правка `settings.json`, системных переменных среды `HTTP_PROXY`/`HTTPS_PROXY` и конфигурации Git отнимает кучу времени, приводит к синтаксическим ошибкам и ломает комментарии в JSONC.
 
-**IDE Proxy Injector** решает это мгновенно:
-- Вставьте прокси в любом формате (хоть ссылку, хоть `host:port:user:pass`).
-- Утилита сама корректно распарсит строку, безопасно пропатчит конфигурации всех установленных IDE, настроит системное окружение и конфигурацию Git, сделает бэкап и проверит соединение!
+**DevProxy** решает это мгновенно:
+- Вставьте прокси в любом формате (ссылку `http://...`, `host:port:user:pass`, `socks5://...`).
+- Утилита сама корректно распарсит строку, безопасно обновит конфигурации всех установленных IDE, установит системные переменные и настройки Git, создаст бэкап и проверит соединение!
 
 ---
 
@@ -31,11 +31,11 @@
   - Установка переменных среды `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (пользовательский уровень Windows/Shell).
   - Настройка глобального `git config` (`http.proxy` и `https.proxy`).
 - 🛡️ **Бережная работа с JSONC**:
-  - Умный синтаксический автомат удаляет `//` и `/* */` комментарии без повреждения ссылок `http://` и строк.
+  - Умный автомат удаляет `//` и `/* */` комментарии без повреждения ссылок `http://` и строк.
   - Автоматическое создание бэкапа `.bak` перед любым изменением.
 - 🔄 **Автонормализация любых форматов**:
   - `http://username:password@1.2.3.4:8080`
-  - `1.2.3.4:8080:username:password` (популярный формат магазинов прокси)
+  - `1.2.3.4:8080:username:password` (популярный формат прокси-провайдеров)
   - `socks5://1.2.3.4:1080`
   - `1.2.3.4:8080`
 - 🧪 **Встроенная проверка связи**:
@@ -49,25 +49,25 @@
 
 ## 🚀 Быстрый старт
 
-### Вариант 1: Запуск готового `.exe` (Windows, без установки чего-либо)
-1. Скачайте `ide-proxy-injector.exe` из [Releases](https://github.com/j46871417-ui/ide-proxy-injector/releases).
-2. Запустите двойным кликом или из терминала:
+### Вариант 1: Запуск готового `.exe` (Windows, без установки зависимостей)
+1. Скачайте `devproxy.exe` из [Releases](https://github.com/j46871417-ui/devproxy/releases).
+2. Запустите двойным кликом или из командной строки:
    ```cmd
-   ide-proxy-injector.exe
+   devproxy.exe
    ```
 3. Выберите пункт `[1]` и вставьте строку прокси.
 
 #### Аргументы командной строки:
 ```cmd
 :: Применить прокси
-ide-proxy-injector.exe http://user:pass@1.2.3.4:8080
-ide-proxy-injector.exe 1.2.3.4:8080:user:pass
+devproxy.exe http://user:pass@1.2.3.4:8080
+devproxy.exe 1.2.3.4:8080:user:pass
 
 :: Проверить текущий статус
-ide-proxy-injector.exe --status
+devproxy.exe --status
 
 :: Полностью отключить и удалить прокси
-ide-proxy-injector.exe --remove
+devproxy.exe --remove
 ```
 
 ---
@@ -75,16 +75,16 @@ ide-proxy-injector.exe --remove
 ### Вариант 2: Запуск через Python (Кроссплатформенно: Windows / macOS / Linux)
 ```bash
 # Клонировать репозиторий
-git clone https://github.com/j46871417-ui/ide-proxy-injector.git
-cd ide-proxy-injector
+git clone https://github.com/j46871417-ui/devproxy.git
+cd devproxy
 
 # Запустить интерактивное меню
-python ide_proxy_injector.py
+python devproxy.py
 
 # Или сразу аргументом:
-python ide_proxy_injector.py "http://user:pass@host:port"
-python ide_proxy_injector.py --status
-python ide_proxy_injector.py --remove
+python devproxy.py "http://user:pass@host:port"
+python devproxy.py --status
+python devproxy.py --remove
 ```
 
 ---
@@ -93,7 +93,7 @@ python ide_proxy_injector.py --remove
 
 Если вы хотите собрать `.exe` самостоятельно на Windows:
 ```cmd
-C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /optimize+ /target:exe /out:ide-proxy-injector.exe IdeProxyInjector.cs
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /optimize+ /target:exe /out:devproxy.exe DevProxy.cs
 ```
 
 ---

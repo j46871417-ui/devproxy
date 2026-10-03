@@ -5,7 +5,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Diagnostics;
 
-namespace IdeProxyInjector
+namespace DevProxy
 {
     class Program
     {
@@ -14,7 +14,7 @@ namespace IdeProxyInjector
         static void Main(string[] args)
         {
             Console.OutputEncoding = Encoding.UTF8;
-            Console.Title = "IDE Proxy Injector " + Version;
+            Console.Title = "DevProxy CLI " + Version;
 
             if (args.Length > 0)
             {
@@ -51,12 +51,12 @@ namespace IdeProxyInjector
             {
                 Console.ForegroundColor = ConsoleColor.Cyan;
                 Console.WriteLine("\n============================================================");
-                Console.WriteLine("  [+] IDE PROXY INJECTOR " + Version + " (Native Windows CLI)");
+                Console.WriteLine("  [+] DevProxy CLI " + Version + " (Native Windows)");
                 Console.WriteLine("      Универсальная настройка Cursor, VS Code, Windsurf, Git");
                 Console.WriteLine("============================================================");
                 Console.ResetColor();
 
-                Console.WriteLine("  [1] Встроить / обновить прокси (вставить строку/ссылку)");
+                Console.WriteLine("  [1] Встроить / обновить прокси (вставить строку или ссылку)");
                 Console.WriteLine("  [2] Проверить текущий статус настроек");
                 Console.WriteLine("  [3] Отключить / удалить прокси со всех IDE и системы");
                 Console.WriteLine("  [0] Выход");
@@ -115,13 +115,13 @@ namespace IdeProxyInjector
 
         static void ShowHelp()
         {
-            Console.WriteLine("IDE Proxy Injector " + Version);
+            Console.WriteLine("DevProxy CLI " + Version);
             Console.WriteLine("Универсальная утилита внедрения прокси в среды разработки.\n");
             Console.WriteLine("Использование:");
-            Console.WriteLine("  ide-proxy-injector.exe [ПРОКСИ]      - Применить прокси");
-            Console.WriteLine("  ide-proxy-injector.exe --status     - Показать текущий статус");
-            Console.WriteLine("  ide-proxy-injector.exe --remove     - Очистить настройки прокси");
-            Console.WriteLine("  ide-proxy-injector.exe --help       - Показать эту справку\n");
+            Console.WriteLine("  devproxy.exe [ПРОКСИ]           - Применить прокси");
+            Console.WriteLine("  devproxy.exe --status          - Показать текущий статус");
+            Console.WriteLine("  devproxy.exe --remove          - Очистить настройки прокси");
+            Console.WriteLine("  devproxy.exe --help            - Показать эту справку\n");
             Console.WriteLine("Поддерживаемые форматы:");
             Console.WriteLine("  http://user:pass@host:port");
             Console.WriteLine("  host:port:user:pass");
@@ -285,7 +285,6 @@ namespace IdeProxyInjector
 
                 if (changed)
                 {
-                    // Очистка возможных лишних запятых
                     content = Regex.Replace(content, @",\s*(\})", "$1");
                     File.WriteAllText(path, content, Encoding.UTF8);
                     return true;
