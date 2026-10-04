@@ -529,7 +529,7 @@ namespace DevProxy
                             string b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(uri.UserInfo));
                             auth = "Proxy-Authorization: Basic " + b64 + "\r\n";
                         }
-                        string connectReq = $"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n{auth}\r\n";
+                        string connectReq = "CONNECT " + host + ":" + port + " HTTP/1.1\r\nHost: " + host + ":" + port + "\r\n" + auth + "\r\n";
                         byte[] reqBytes = Encoding.UTF8.GetBytes(connectReq);
                         remoteStream.Write(reqBytes, 0, reqBytes.Length);
 
