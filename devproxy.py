@@ -204,7 +204,120 @@ def write_json_settings(path: str, data: dict):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
 
+
+import socket, threading, select
+AI_DOMAINS = [
+    "googleapis.com", "google.com", "google.dev", "gstatic.com",
+    "openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com",
+    "anthropic.com", "claude.ai", "claudeusercontent.com",
+    "x.ai", "grok.com", "sora.com", "cursor.sh", "cursor.com",
+    "windsurf.ai", "codeium.com", "githubcopilot.com", "perplexity.ai",
+    "huggingface.co", "midjourney.com"
+]
+
+def is_ai_domain(host):
+    host = host.lower().split(':')[0]
+    for d in AI_DOMAINS:
+        if host == d or host.endswith("." + d):
+            return True
+    return False
+
+def handle_client(client_sock, upstream_url):
+    try:
+        req = client_sock.recv(8192)
+        if not req:
+            client_sock.close()
+            return
+        lines = req.split(b'\r\n')
+        first_line = lines[0].decode('utf-8', 'ignore')
+        method, url, proto = first_line.split(' ')
+        host = ""
+        port = 80
+        if method == "CONNECT":
+            host_port = url.split(':')
+            host = host_port[0]
+            port = int(host_port[1]) if len(host_port) > 1 else 443
+        else:
+            for line in lines[1:]:
+                if line.lower().startswith(b'host:'):
+                    host_val = line.split(b':', 1)[1].strip().decode('utf-8', 'ignore')
+                    if ':' in host_val:
+                        host = host_val.split(':')[0]
+                        port = int(host_val.split(':')[1])
+                    else:
+                        host = host_val
+                    break
+        use_proxy = is_ai_domain(host)
+        remote_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if use_proxy:
+            import urllib.parse
+            parsed = urllib.parse.urlparse(upstream_url)
+            up_host = parsed.hostname
+            up_port = parsed.port or 80
+            remote_sock.connect((up_host, up_port))
+            if method == "CONNECT":
+                auth = ""
+                if parsed.username and parsed.password:
+                    import base64
+                    cred = f"{parsed.username}:{parsed.password}"
+                    b64 = base64.b64encode(cred.encode()).decode()
+                    auth = f"Proxy-Authorization: Basic {b64}\r\n"
+                connect_req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n{auth}\r\n"
+                remote_sock.sendall(connect_req.encode())
+                resp = remote_sock.recv(8192)
+                if b"200 Connection" not in resp:
+                    client_sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                    client_sock.close()
+                    remote_sock.close()
+                    return
+                client_sock.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            else:
+                if parsed.username and parsed.password:
+                    import base64
+                    cred = f"{parsed.username}:{parsed.password}"
+                    b64 = base64.b64encode(cred.encode()).decode()
+                    auth_header = f"Proxy-Authorization: Basic {b64}\r\n".encode()
+                    req = req.replace(b"\r\n", b"\r\n" + auth_header, 1)
+                remote_sock.sendall(req)
+        else:
+            remote_sock.connect((host, port))
+            if method == "CONNECT":
+                client_sock.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            else:
+                remote_sock.sendall(req)
+        def pipe(src, dst):
+            try:
+                while True:
+                    data = src.recv(8192)
+                    if not data: break
+                    dst.sendall(data)
+            except: pass
+            finally:
+                src.close()
+                dst.close()
+        threading.Thread(target=pipe, args=(client_sock, remote_sock)).start()
+        threading.Thread(target=pipe, args=(remote_sock, client_sock)).start()
+    except Exception as e:
+        client_sock.close()
+
+def run_local_proxy(port, upstream_url):
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("127.0.0.1", port))
+    server.listen(100)
+    print(f"Local AI Split Proxy listening on 127.0.0.1:{port}")
+    print(f"Upstream: {upstream_url}")
+    while True:
+        client, addr = server.accept()
+        threading.Thread(target=handle_client, args=(client, upstream_url)).start()
+
+
 def apply_proxy(proxy_url: str):
+    import subprocess, sys
+    if "--daemon" not in sys.argv:
+        print(f"\n{Colors.CYAN}{Colors.BOLD}[*] Р—Р°РїСѓСЃРєР°РµРј Р»РѕРєР°Р»СЊРЅС‹Р№ AI split-proxy РІ С„РѕРЅРµ...{Colors.RESET}")
+        subprocess.Popen([sys.executable, __file__, "--daemon", proxy_url], creationflags=subprocess.CREATE_NEW_CONSOLE if sys.platform == 'win32' else 0)
+        proxy_url = "http://127.0.0.1:11438"
+
     print(f"\n{Colors.CYAN}{Colors.BOLD}[+] Применяем прокси: {proxy_url}{Colors.RESET}")
     targets = get_target_configs()
 
@@ -388,6 +501,10 @@ def show_status():
     print()
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--daemon":
+        run_local_proxy(11438, sys.argv[2])
+        return
+
     if len(sys.argv) > 1:
         arg = sys.argv[1].strip()
         if arg in ("--remove", "-r", "clean", "remove"):

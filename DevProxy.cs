@@ -13,6 +13,12 @@ namespace DevProxy
 
         static void Main(string[] args)
         {
+            if (args.Length > 0 && args[0] == "--daemon")
+            {
+                RunLocalProxy(args[1]);
+                return;
+            }
+
             Console.OutputEncoding = Encoding.UTF8;
             Console.Title = "DevProxy CLI " + Version;
 
@@ -427,8 +433,179 @@ namespace DevProxy
             }
         }
 
+        
+        static readonly string[] AiDomains = {
+            "googleapis.com", "google.com", "google.dev", "gstatic.com",
+            "openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com",
+            "anthropic.com", "claude.ai", "claudeusercontent.com",
+            "x.ai", "grok.com", "sora.com", "cursor.sh", "cursor.com",
+            "windsurf.ai", "codeium.com", "githubcopilot.com", "perplexity.ai",
+            "huggingface.co", "midjourney.com"
+        };
+
+        static bool IsAiDomain(string host)
+        {
+            host = host.ToLower();
+            if (host.Contains(":")) host = host.Split(':')[0];
+            foreach (var d in AiDomains)
+            {
+                if (host == d || host.EndsWith("." + d)) return true;
+            }
+            return false;
+        }
+
+        static void RunLocalProxy(string upstreamUrl)
+        {
+            var listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 11438);
+            listener.Start();
+            Console.WriteLine("Local AI Split Proxy listening on 127.0.0.1:11438");
+            Console.WriteLine("Upstream: " + upstreamUrl);
+            while (true)
+            {
+                var client = listener.AcceptTcpClient();
+                System.Threading.ThreadPool.QueueUserWorkItem(state => HandleClient(client, upstreamUrl));
+            }
+        }
+
+        static void HandleClient(System.Net.Sockets.TcpClient client, string upstreamUrl)
+        {
+            try
+            {
+                var stream = client.GetStream();
+                byte[] buffer = new byte[8192];
+                int bytesRead = stream.Read(buffer, 0, buffer.Length);
+                if (bytesRead == 0) { client.Close(); return; }
+
+                string request = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+                string[] lines = request.Split(new[] { "\r\n" }, StringSplitOptions.None);
+                string[] firstLine = lines[0].Split(' ');
+                string method = firstLine[0];
+                string url = firstLine[1];
+
+                string host = "";
+                int port = 80;
+
+                if (method == "CONNECT")
+                {
+                    string[] hp = url.Split(':');
+                    host = hp[0];
+                    port = hp.Length > 1 ? int.Parse(hp[1]) : 443;
+                }
+                else
+                {
+                    foreach (var line in lines)
+                    {
+                        if (line.ToLower().StartsWith("host:"))
+                        {
+                            string h = line.Substring(5).Trim();
+                            if (h.Contains(":"))
+                            {
+                                host = h.Split(':')[0];
+                                port = int.Parse(h.Split(':')[1]);
+                            }
+                            else
+                            {
+                                host = h;
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                bool useProxy = IsAiDomain(host);
+                var remoteClient = new System.Net.Sockets.TcpClient();
+
+                if (useProxy)
+                {
+                    Uri uri = new Uri(upstreamUrl);
+                    remoteClient.Connect(uri.Host, uri.Port);
+                    var remoteStream = remoteClient.GetStream();
+
+                    if (method == "CONNECT")
+                    {
+                        string auth = "";
+                        if (!string.IsNullOrEmpty(uri.UserInfo))
+                        {
+                            string b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(uri.UserInfo));
+                            auth = "Proxy-Authorization: Basic " + b64 + "\r\n";
+                        }
+                        string connectReq = $"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n{auth}\r\n";
+                        byte[] reqBytes = Encoding.UTF8.GetBytes(connectReq);
+                        remoteStream.Write(reqBytes, 0, reqBytes.Length);
+
+                        byte[] respBuffer = new byte[8192];
+                        int respRead = remoteStream.Read(respBuffer, 0, respBuffer.Length);
+                        string respStr = Encoding.UTF8.GetString(respBuffer, 0, respRead);
+                        if (!respStr.Contains("200 Connection"))
+                        {
+                            byte[] errBytes = Encoding.UTF8.GetBytes("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+                            stream.Write(errBytes, 0, errBytes.Length);
+                            client.Close();
+                            remoteClient.Close();
+                            return;
+                        }
+                        byte[] okBytes = Encoding.UTF8.GetBytes("HTTP/1.1 200 Connection established\r\n\r\n");
+                        stream.Write(okBytes, 0, okBytes.Length);
+                    }
+                    else
+                    {
+                        if (!string.IsNullOrEmpty(uri.UserInfo))
+                        {
+                            string b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(uri.UserInfo));
+                            string authHeader = "Proxy-Authorization: Basic " + b64 + "\r\n";
+                            int idx = request.IndexOf("\r\n");
+                            request = request.Insert(idx + 2, authHeader);
+                            byte[] reqBytes = Encoding.UTF8.GetBytes(request);
+                            remoteStream.Write(reqBytes, 0, reqBytes.Length);
+                        }
+                        else
+                        {
+                            remoteStream.Write(buffer, 0, bytesRead);
+                        }
+                    }
+                }
+                else
+                {
+                    remoteClient.Connect(host, port);
+                    var remoteStream = remoteClient.GetStream();
+                    if (method == "CONNECT")
+                    {
+                        byte[] okBytes = Encoding.UTF8.GetBytes("HTTP/1.1 200 Connection established\r\n\r\n");
+                        stream.Write(okBytes, 0, okBytes.Length);
+                    }
+                    else
+                    {
+                        remoteStream.Write(buffer, 0, bytesRead);
+                    }
+                }
+
+                System.Threading.Tasks.Task.Run(() => {
+                    try { stream.CopyTo(remoteClient.GetStream()); } catch { }
+                });
+                System.Threading.Tasks.Task.Run(() => {
+                    try { remoteClient.GetStream().CopyTo(stream); } catch { }
+                });
+            }
+            catch
+            {
+                client.Close();
+            }
+        }
+
         static void ApplyProxy(string proxyUrl)
         {
+            if (Environment.GetCommandLineArgs().Length <= 1 || Environment.GetCommandLineArgs()[1] != "--daemon")
+            {
+                Console.WriteLine("\n[*] Р—Р°РїСѓСЃРєР°РµРј Р»РѕРєР°Р»СЊРЅС‹Р№ AI split-proxy РІ С„РѕРЅРµ...");
+                ProcessStartInfo psi = new ProcessStartInfo();
+                psi.FileName = Process.GetCurrentProcess().MainModule.FileName;
+                psi.Arguments = "--daemon \"" + proxyUrl + "\"";
+                psi.UseShellExecute = true;
+                psi.WindowStyle = ProcessWindowStyle.Hidden;
+                Process.Start(psi);
+                proxyUrl = "http://127.0.0.1:11438";
+            }
+
             Console.WriteLine("\n[+] Применяем прокси: " + proxyUrl);
 
             // 1. IDEs
