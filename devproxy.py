@@ -312,12 +312,6 @@ def run_local_proxy(port, upstream_url):
 
 
 def apply_proxy(proxy_url: str):
-    import subprocess, sys
-    if "--daemon" not in sys.argv:
-        print(f"\n{Colors.CYAN}{Colors.BOLD}[*] Р—Р°РїСѓСЃРєР°РµРј Р»РѕРєР°Р»СЊРЅС‹Р№ AI split-proxy РІ С„РѕРЅРµ...{Colors.RESET}")
-        subprocess.Popen([sys.executable, __file__, "--daemon", proxy_url], creationflags=subprocess.CREATE_NEW_CONSOLE if sys.platform == 'win32' else 0)
-        proxy_url = "http://127.0.0.1:11438"
-
     print(f"\n{Colors.CYAN}{Colors.BOLD}[+] Применяем прокси: {proxy_url}{Colors.RESET}")
     targets = get_target_configs()
 

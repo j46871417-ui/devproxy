@@ -594,18 +594,6 @@ namespace DevProxy
 
         static void ApplyProxy(string proxyUrl)
         {
-            if (Environment.GetCommandLineArgs().Length <= 1 || Environment.GetCommandLineArgs()[1] != "--daemon")
-            {
-                Console.WriteLine("\n[*] Р—Р°РїСѓСЃРєР°РµРј Р»РѕРєР°Р»СЊРЅС‹Р№ AI split-proxy РІ С„РѕРЅРµ...");
-                ProcessStartInfo psi = new ProcessStartInfo();
-                psi.FileName = Process.GetCurrentProcess().MainModule.FileName;
-                psi.Arguments = "--daemon \"" + proxyUrl + "\"";
-                psi.UseShellExecute = true;
-                psi.WindowStyle = ProcessWindowStyle.Hidden;
-                Process.Start(psi);
-                proxyUrl = "http://127.0.0.1:11438";
-            }
-
             Console.WriteLine("\n[+] Применяем прокси: " + proxyUrl);
 
             // 1. IDEs
