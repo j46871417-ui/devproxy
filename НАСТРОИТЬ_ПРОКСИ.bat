@@ -6,4 +6,6 @@ if exist "%~dp0devproxy.exe" (
 ) else (
     python "%~dp0devproxy.py" %*
 )
-exit /b %errorlevel%
+set "devproxy_exit=%errorlevel%"
+if not "%devproxy_exit%"=="0" if "%~1"=="" pause
+exit /b %devproxy_exit%

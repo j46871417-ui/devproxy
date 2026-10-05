@@ -58,10 +58,22 @@ class WindowsJob:
 
 def command_for(executable, extra_args):
     """Use the JS entrypoint of npm shims instead of handing arguments to cmd."""
+    executable = os.fspath(executable)
+    executable = executable if os.path.isfile(executable) else shutil.which(executable)
+    if not executable:
+        raise FileNotFoundError('Application executable not found.')
     if os.name == 'nt' and executable.lower().endswith(('.cmd', '.bat')):
+        # VS Code-family PATH commands live in <installation>/bin. Launch the
+        # native GUI rather than trying to interpret its batch wrapper as npm.
+        directory = Path(executable).resolve().parent
+        native_names = {'code': 'Code.exe', 'cursor': 'Cursor.exe', 'windsurf': 'Windsurf.exe',
+                        'codium': 'VSCodium.exe', 'antigravity': 'Antigravity.exe'}
+        native = native_names.get(Path(executable).stem.lower())
+        if native and directory.name.lower() == 'bin' and (directory.parent / native).is_file():
+            return [str(directory.parent / native)] + list(extra_args)
         with open(executable, encoding='utf-8-sig') as handle:
             text = handle.read()
-        matches = re.findall(r'"%dp0%[\\/]([^"\r\n]+\.js)"', text, re.IGNORECASE)
+        matches = re.findall(r'"(?:%dp0%[\\/]|%~dp0[\\/]?)([^"\r\n]+\.(?:js|cjs|mjs))"', text, re.IGNORECASE)
         if not matches:
             raise ValueError('Batch launcher unsupported. Select the native executable with --executable.')
         script = os.path.normpath(os.path.join(os.path.dirname(executable), matches[-1]))
@@ -76,8 +88,6 @@ def command_for(executable, extra_args):
 class Launcher:
     @staticmethod
     def launch(executable, extra_args=None, env_vars=None, wait=False, cwd=None):
-        if not os.path.isfile(executable) and not shutil.which(executable):
-            raise FileNotFoundError('Application executable not found.')
         env = os.environ.copy()
         env.update(env_vars or {})
         process = subprocess.Popen(command_for(executable, extra_args or []), env=env, cwd=cwd,

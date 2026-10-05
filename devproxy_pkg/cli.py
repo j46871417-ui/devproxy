@@ -298,16 +298,17 @@ def cmd_detect(args):
 
 
 def interactive_wizard(initial_proxy=None):
-    print('DevProxy', __version__)
-    raw = initial_proxy or getpass.getpass('Proxy URL (hidden): ')
-    app = input('Application ID (antigravity, cursor, vscode, codex, opencode, claude): ').strip()
-    return main(['run', app, '--proxy', raw])
+    from .interactive import InteractiveMenu
+    return InteractiveMenu(initial_proxy).run()
+
+
+def redact_error(message):
+    return re.sub(r'\S*://\S+@\S*|\S+:\S+@\S+', '<credentials hidden>', message)
 
 
 class SafeParser(argparse.ArgumentParser):
     def error(self, message):
-        message = re.sub(r'\S*://\S+@\S*|\S+:\S+@\S+', '<credentials hidden>', message)
-        super().error(message)
+        super().error(redact_error(message))
 
 
 def main(argv=None):
@@ -404,7 +405,7 @@ def main(argv=None):
         print('Input ended.', file=sys.stderr)
         return 1
     except (OSError, ValueError, RuntimeError) as error:
-        print('Error:', str(error), file=sys.stderr)
+        print('Error:', redact_error(str(error)), file=sys.stderr)
         return 1
 
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DevProxy 2.0.0
+DevProxy
 Universal IDE & Dev Tools Proxy Connection Manager.
 """
 

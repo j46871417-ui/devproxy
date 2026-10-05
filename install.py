@@ -14,7 +14,7 @@ import tempfile
 import urllib.request
 import zipfile
 
-VERSION = '2.0.1'
+VERSION = '2.0.2'
 
 
 def install(archive, prefix, expected_sha256=None):

@@ -8,6 +8,7 @@ import tempfile
 import unittest
 import zipfile
 import install as installer
+from devproxy_pkg import __version__
 
 
 def source_archive(extra=None):
@@ -41,7 +42,7 @@ class Installation(unittest.TestCase):
             command = [str(launcher),'--version']
         result = subprocess.run(command,capture_output=True,text=True)
         self.assertEqual(result.returncode,0,result.stderr)
-        self.assertEqual(result.stdout.strip(),'2.0.1')
+        self.assertEqual(result.stdout.strip(), __version__)
         second, _ = installer.install(data,self.prefix)
         self.assertEqual(second,launcher)
 
