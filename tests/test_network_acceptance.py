@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from devproxy_pkg.core.profile import ProxyProfile
 from devproxy_pkg.core.transport import read_headers, recv_exact
 from devproxy_pkg.core.tunnel import LocalTunnel
@@ -184,5 +185,14 @@ class NetworkAcceptance(unittest.TestCase):
         self.addCleanup(tunnel.stop)
         client = socket.create_connection(('127.0.0.1', tunnel.start()), timeout=3)
         self.addCleanup(client.close)
-        client.sendall(b'GET / HTTP/1.1\r\nX: ' + b'x' * 70000)
-        self.assertIn(b'400', client.recv(1024))
+        with patch('devproxy_pkg.core.tunnel.connect_upstream') as connect:
+            try:
+                client.sendall(b'GET / HTTP/1.1\r\nX: ' + b'x' * 70000)
+                self.assertIn(b'400', client.recv(1024))
+            except ConnectionResetError:
+                # Windows may reset a rejected connection with unread input
+                # instead of delivering the queued 400 response. Both reject
+                # oversized headers; neither may open an upstream connection.
+                pass
+            tunnel.stop()
+            connect.assert_not_called()
