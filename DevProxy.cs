@@ -256,7 +256,7 @@ namespace DevProxy
                 content = StripJsonComments(content);
 
                 content = UpsertJsonField(content, "http.proxy", "\"" + EscapeJson(proxyUrl) + "\"");
-                content = UpsertJsonField(content, "http.proxyStrictSSL", "false");
+                content = UpsertJsonField(content, "http.proxyStrictSSL", "true");
                 content = UpsertJsonField(content, "http.proxySupport", "\"on\"");
 
                 File.WriteAllText(path, content, Encoding.UTF8);

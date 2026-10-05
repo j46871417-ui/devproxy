@@ -1,133 +1,131 @@
-# DevProxy CLI ⚡
+# DevProxy 2.0 ⚡
 
-> **Универсальная легковесная утилита для автоматического внедрения и переключения прокси во всех средах разработки (Cursor, VS Code, Windsurf, VSCodium), Git и терминале в один клик. Работает на Windows, Linux и macOS.**
+> **Универсальный и безопасный менеджер подключения IDE и инструментов разработки через собственный прокси пользователя.**  
+> Поддержка: **Google Antigravity, VS Code, Cursor, Windsurf, VSCodium, OpenCode, Codex CLI и Codex Desktop (GUI)**.  
+> Кроссплатформенно: Windows, macOS, Linux.
 
-[![Release](https://img.shields.io/badge/Release-v1.1.0-blue.svg)](https://github.com/j46871417-ui/devproxy/releases)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-brightgreen.svg)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Security: Audited](https://img.shields.io/badge/Security-OS%20Keyring%20%7C%20Fail--Closed-blue.svg)]()
 
 ---
 
-## 🎯 Зачем это нужно?
+## 🎯 Ключевые возможности
 
-При разработке с AI-ассистентами в современных IDE (Cursor, VS Code, Windsurf), а также при работе через VPN или корпоративные шлюзы разработчикам регулярно требуется прокси.
-Ручная правка `settings.json`, системных переменных среды (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `http_proxy`, `https_proxy`) и конфигурации Git отнимает кучу времени, приводит к синтаксическим ошибкам и ломает комментарии в JSONC.
-
-**DevProxy** решает это мгновенно:
-- Вставьте прокси в любом формате (ссылку `http://...`, `host:port:user:pass`, `socks5://...`).
-- Утилита сама корректно распарсит строку, безопасно обновит конфигурации всех установленных IDE, настроит переменные терминала и конфигурацию Git, создаст бэкап и проверит соединение!
-
----
-
-## ✨ Возможности
-
-- 🚀 **Поддержка популярных IDE**:
-  - [Cursor](https://cursor.com) (`~/.config/Cursor` / `%APPDATA%\Cursor`)
-  - [Visual Studio Code](https://code.visualstudio.com) (`~/.config/Code` / `%APPDATA%\Code`)
-  - [Windsurf](https://codeium.com/windsurf) (`~/.config/Windsurf` / `%APPDATA%\Windsurf`)
-  - [VSCodium](https://vscodium.com) (`~/.config/VSCodium` / `%APPDATA%\VSCodium`)
-  - [Antigravity IDE](https://github.com)
-  - Поддержка Flatpak версий в Linux (`~/.var/app/...`)
-- 🌐 **Системная интеграция**:
-  - **Linux / macOS**: персистентная запись в `~/.bashrc`, `~/.zshrc` и `~/.profile` (экспорт `http_proxy`, `https_proxy`, `all_proxy`, `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `no_proxy`).
-  - **Windows**: установка переменных среды пользователя (`setx HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`).
-  - **Git**: настройка глобального `git config` (`http.proxy` и `https.proxy`).
-- 🛡️ **Бережная работа с JSONC**:
-  - Умный автомат удаляет `//` и `/* */` комментарии без повреждения ссылок `http://` и строк.
-  - Автоматическое создание бэкапа `.bak` перед любым изменением.
-- 🔄 **Автонормализация любых форматов**:
-  - `http://username:password@1.2.3.4:8080`
-  - `1.2.3.4:8080:username:password` (популярный формат прокси-провайдеров)
-  - `socks5://1.2.3.4:1080`
-  - `1.2.3.4:8080`
-- 🧪 **Встроенная проверка связи**:
-  - Автоматическое тестирование туннеля с пингом целевых хостов (Google Generative AI / Web) с передачей Proxy Basic Auth.
-- 🧹 **Сброс в 1 клик**:
-  - Полное удаление настроек прокси из всех редакторов, Git и переменных окружения (`--remove`).
-- 📦 **Zero-dependency**:
-  - **Windows**: Автономный `.exe` (C#), работает сразу без установки чего-либо.
-  - **Linux / macOS**: Нативный Bash-скрипт `devproxy` или кроссплатформенный Python CLI `devproxy.py`.
+1. **Главный сценарий: собственный прокси**:
+   - Пользователь вставляет свой собственный прокси (HTTP, HTTPS, SOCKS5, SOCKS5h).
+   - Утилита проверяет соединение (TCP пинг, авторизация прокси, доступ к AI-провайдерам без автоматического слива IP).
+   - Сохраняет именованный профиль в защищенном хранилище.
+   - Запускает выбранное приложение через изолированный профиль (Режим сессии по умолчанию) либо применяет постоянные настройки по выбору.
+2. **Безопасность первого класса**:
+   - 🔒 **Строгий TLS всегда включен**: Никаких `proxyStrictSSL=false`, `NODE_TLS_REJECT_UNAUTHORIZED=0` или `--ignore-certificate-errors`.
+   - 🛡️ **Защищенное хранение паролей**: Пароли сохраняются только в платформенном защищенном хранилище: **Windows Credential Manager / DPAPI**, **macOS Keychain**, **Linux Secret Service**. В конфигурационные файлы, переменные окружения, логи или консольный вывод открытые пароли никогда не попадают.
+   - 🚫 **Fail-Closed**: При обрыве или ошибке прокси локальный мост не сбрасывает трафик в прямой незащищенный интернет (возвращается 502/504 Bad Gateway).
+   - 📦 **Никакого MitM**: Трафик между приложением и AI-провайдером (Google, OpenAI, Anthropic) передается сквозными зашифрованными TLS-байтами без чтения промптов, токенов или подмены ответов.
+3. **Модульная архитектура адаптеров**:
+   - `ProxyProfile`: Валидация и нормализация URL, IPv6 `[::1]`, URL-encoded спецсимволов.
+   - `SecretStore`: Платформенное шифрование учетных данных.
+   - `ProxyValidator`: Пошаговое тестирование канала.
+   - `ApplicationAdapter`: Индивидуальные адаптеры для Antigravity, VS Code, Cursor, Windsurf, VSCodium, OpenCode, Codex CLI, Codex GUI.
+   - `Launcher`: Безопасный запуск процессов (без `shell=True`).
+   - `ConfigEditor`: Бережное редактирование JSONC/TOML с сохранением комментариев и атомарной записью.
+   - `Tunnel`: Локальный петлевой мост (loopback `127.0.0.1`) для прозрачного SOCKS5/HTTP подключения.
+   - `Recovery`: Точный откат только внесенных утилитой изменений.
 
 ---
 
-## 🐧 Быстрый старт на Linux & macOS
+## 🚀 Быстрый старт
 
-### Вариант 1: Быстрая установка в 1 команду (curl)
+### Интерактивный мастер (простейший путь):
 ```bash
-curl -fsSL https://raw.githubusercontent.com/j46871417-ui/devproxy/main/install.sh | bash
-```
-После установки утилита доступна напрямую в терминале:
-```bash
-# Интерактивное меню
-devproxy
-
-# Применить прокси сразу
-devproxy http://user:pass@1.2.3.4:8080
-devproxy 1.2.3.4:8080:user:pass
-
-# Проверить статус
-devproxy --status
-
-# Полностью удалить прокси со всех IDE и терминала
-devproxy --remove
-```
-
-### Вариант 2: Запуск из репозитория или архива
-```bash
-# Клонировать репозиторий
-git clone https://github.com/j46871417-ui/devproxy.git
-cd devproxy
-
-# Сделать исполняемым и запустить
-chmod +x devproxy
+python devproxy.py
+# или в Windows:
+devproxy.exe
+# или в Linux / macOS:
 ./devproxy
 ```
+Мастер проведет по шагам:  
+**«Вставить свой прокси → проверить → выбрать приложение → запустить»**.
 
 ---
 
-## 🪟 Быстрый старт на Windows
+## 💻 Команды CLI
 
-1. Скачайте `devproxy.exe` из [Releases](https://github.com/j46871417-ui/devproxy/releases).
-2. Запустите двойным кликом или из консоли:
-   ```cmd
-   devproxy.exe
-   ```
-3. Выберите `[1]` и вставьте строку прокси.
-
-```cmd
-:: Применить прокси аргументом
-devproxy.exe http://user:pass@1.2.3.4:8080
-devproxy.exe 1.2.3.4:8080:user:pass
-
-:: Статус
-devproxy.exe --status
-
-:: Сброс
-devproxy.exe --remove
-```
-
----
-
-## 🐍 Кроссплатформенный запуск через Python
-
+### 1. Управление профилями
 ```bash
-python3 devproxy.py
-# или:
-python3 devproxy.py "http://user:pass@host:port"
-python3 devproxy.py --status
-python3 devproxy.py --remove
+# Добавить профиль со своим прокси
+python devproxy.py profile add "socks5://user:password@1.2.3.4:10808" --name mynode
+python devproxy.py profile add "http://1.2.3.4:8080" --name office
+
+# Просмотреть сохраненные профили (секреты надежно замаскированы)
+python devproxy.py profile list
+
+# Удалить профиль
+python devproxy.py profile remove mynode
 ```
+
+### 2. Проверка соединения
+```bash
+# Проверить профиль
+python devproxy.py test --profile mynode
+
+# Проверить ad-hoc прокси без сохранения
+python devproxy.py test --proxy "socks5://127.0.0.1:10808"
+
+# Опциональная проверка исходящего внешнего IP (с явным указанием целевого хоста)
+python devproxy.py test --profile mynode --echo
+```
+
+### 3. Список приложений
+```bash
+python devproxy.py apps list
+```
+Показывает установленные на компьютере среды разработки (`antigravity`, `vscode`, `cursor`, `windsurf`, `vscodium`, `opencode`, `codex`, `codex-gui`) и пути к их исполняемым файлам.
+
+### 4. Режим сессии (Запуск без изменения системных настроек)
+```bash
+# Запустить Google Antigravity через профиль mynode
+python devproxy.py run antigravity --profile mynode
+
+# Запустить Cursor с передачей дополнительных аргументов рабочей директории
+python devproxy.py run cursor --profile mynode -- .
+
+# Запустить Codex CLI
+python devproxy.py run codex --profile mynode
+```
+
+### 5. Постоянная настройка (Persistent) и Откат (Recovery)
+```bash
+# Применить настройки к выбранному приложению
+python devproxy.py apply --app antigravity --profile mynode
+python devproxy.py apply --app vscode,cursor --profile mynode
+
+# Безопасный откат настроек приложения к исходным
+python devproxy.py restore --app antigravity
+python devproxy.py restore --app vscode,cursor
+```
+
+### 6. Дополнительно: Поиск локальных клиентов
+```bash
+python devproxy.py detect
+python devproxy.py detect --save
+```
+*(Функция исключительно по запросу: никогда не запускается автоматически и не меняет введенный адрес без подтверждения).*
 
 ---
 
-## 🛠️ Сборка Windows бинарника (.exe) из исходников
+## 📊 Матрица поддержки
 
-```cmd
-C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /optimize+ /target:exe /out:devproxy.exe DevProxy.cs
-```
+Подробная матрица интеграции **Приложение × ОС × Способ подключения** доступна в [MATRIX.md](MATRIX.md).
 
 ---
 
-## 📄 Лицензия
+## 🛡️ Безопасность и проверка подлинности сборок
 
-MIT License. Свободно для личного и коммерческого использования.
+- Исходный код C# скомпилирован через официальный компилятор платформы.
+- Контрольная сумма `devproxy.exe`:
+  - **SHA-256**: `D1104B97008E7E7EBD3A329109BF4CFFF616B0CC6E210429A50F0AADE383794A`
+- Запуск тестов:
+  ```bash
+  python -m unittest discover -s tests -p "test_*.py"
+  ```
