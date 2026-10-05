@@ -176,7 +176,10 @@ class WindowsWrappers(unittest.TestCase):
         native.touch()
         shim = folder / 'cursor.cmd'
         shim.write_text('@echo off')
-        self.assertEqual(command_for(str(shim), ['--new-window']), [str(native), '--new-window'])
+        command = command_for(str(shim), ['--new-window'])
+        # Windows runners may expose TEMP through an 8.3 alias (RUNNER~1).
+        self.assertTrue(os.path.samefile(command[0], native))
+        self.assertEqual(command[1:], ['--new-window'])
 
     def test_unknown_batch_wrapper_reports_actionable_error(self):
         shim = self.base / 'fixture.cmd'
