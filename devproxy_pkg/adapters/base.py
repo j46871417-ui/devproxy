@@ -16,6 +16,11 @@ from ..core.profile import ProxyProfile
 
 
 class ApplicationAdapter(ABC):
+    session_gui = False
+
+    def persistent_plan(self, profile, config_path=None):
+        raise ValueError('Persistent proxy settings are unsupported for this application; use run or exec.')
+
     @property
     @abstractmethod
     def app_id(self) -> str:

@@ -1,269 +1,330 @@
-"""
-Tunnel: Local loopback forwarder and transport proxy bridge.
-Ensures:
-- Local loopback only (127.0.0.1 or ::1) on an ephemeral or designated port.
-- Transparent streaming of encrypted bytes (NO MitM decryption, NO inspecting prompts/code, NO tampering with responses).
-- Bridges tools that only understand plain HTTP proxy to SOCKS5 or authenticated upstreams.
-- Injects Proxy-Authorization only toward the designated upstream proxy.
-- FAIL-CLOSED: Errors from upstream proxy return 502/504 Bad Gateway, NEVER falling back to unproxied direct connection.
-"""
-
-import socket
-import threading
+"""Loopback HTTP bridge to a designated HTTP, HTTPS or SOCKS5 upstream."""
+import ipaddress
+import re
 import select
-import base64
+import socket
+import ssl
+import threading
 import time
 import urllib.parse
-from typing import Optional, Tuple
-from .profile import ProxyProfile
+from .transport import (read_headers, parse_authority, authority, connect_upstream,
+                        http_connect, socks5_connect, proxy_auth_header)
 
 
 class LocalTunnel:
-    def __init__(self, profile: ProxyProfile, bind_host: str = "127.0.0.1", bind_port: int = 0):
-        self.profile = profile
-        self.bind_host = bind_host
-        self.bind_port = bind_port
-        self.server_sock: Optional[socket.socket] = None
+    def __init__(self, profile, bind_host='127.0.0.1', bind_port=0, idle_timeout=None):
+        if not ipaddress.ip_address(bind_host).is_loopback:
+            raise ValueError('Tunnel listener must use a loopback address.')
+        self.profile, self.bind_host, self.bind_port = profile, bind_host, bind_port
+        self.idle_timeout = idle_timeout
+        self.server_sock = None
         self.is_running = False
-        self._thread: Optional[threading.Thread] = None
-        self.allocated_port: int = 0
+        self.allocated_port = 0
+        self._thread = None
+        self._lock = threading.Lock()
+        self._connections = set()
+        self._workers = set()
 
-    def start(self, timeout: float = 3.0) -> int:
-        """Starts loopback server and returns bound port."""
-        family = socket.AF_INET6 if ":" in self.bind_host else socket.AF_INET
-        self.server_sock = socket.socket(family, socket.SOCK_STREAM)
-        self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_sock.bind((self.bind_host, self.bind_port))
-        self.server_sock.listen(128)
-        self.allocated_port = self.server_sock.getsockname()[1]
+    def start(self, timeout=3):
+        if self.is_running:
+            return self.allocated_port
+        family = socket.AF_INET6 if ':' in self.bind_host else socket.AF_INET
+        server = socket.socket(family, socket.SOCK_STREAM)
+        try:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind((self.bind_host, self.bind_port))
+            server.listen(128)
+            server.settimeout(0.2)
+        except Exception:
+            server.close()
+            raise
+        self.server_sock = server
+        self.allocated_port = server.getsockname()[1]
         self.is_running = True
-
-        self._thread = threading.Thread(target=self._serve_loop, daemon=True, name="DevProxyTunnel")
+        self._thread = threading.Thread(target=self._serve_loop, daemon=True, name='DevProxyTunnel')
         self._thread.start()
-
-        # Readiness check
-        t0 = time.time()
-        while time.time() - t0 < timeout:
-            try:
-                test_sock = socket.create_connection((self.bind_host, self.allocated_port), timeout=0.2)
-                test_sock.close()
-                return self.allocated_port
-            except Exception:
-                time.sleep(0.05)
-
         return self.allocated_port
 
     def stop(self):
-        """Stops server and terminates connections."""
         self.is_running = False
         if self.server_sock:
+            self.server_sock.close()
+        with self._lock:
+            sockets, workers = list(self._connections), list(self._workers)
+        for sock in sockets:
             try:
-                self.server_sock.close()
-            except Exception:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
                 pass
+            sock.close()
+        for worker in [self._thread] + workers:
+            if worker and worker is not threading.current_thread():
+                worker.join(timeout=2)
+
+    def _track(self, sock):
+        with self._lock:
+            if not self.is_running:
+                sock.close()
+                raise OSError('Proxy session stopped.')
+            self._connections.add(sock)
 
     def _serve_loop(self):
         while self.is_running:
             try:
-                client_sock, addr = self.server_sock.accept()
-                t = threading.Thread(target=self._handle_client, args=(client_sock,), daemon=True)
-                t.start()
-            except Exception:
-                if not self.is_running:
-                    break
+                client, _ = self.server_sock.accept()
+                with self._lock:
+                    if not self.is_running:
+                        client.close()
+                        break
+                    if len(self._workers) >= 128:
+                        client.close()
+                        continue
+                    self._connections.add(client)
+                    worker = threading.Thread(target=self._handle_client, args=(client,), daemon=True)
+                    self._workers.add(worker)
+                worker.start()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
 
-    def _handle_client(self, client_sock: socket.socket):
+    def _handle_client(self, client_sock):
+        upstream, established = None, False
         try:
-            client_sock.settimeout(15.0)
-            req_data = client_sock.recv(8192)
-            if not req_data:
-                client_sock.close()
-                return
-
-            lines = req_data.split(b"\r\n")
-            if not lines:
-                client_sock.close()
-                return
-
-            first_line = lines[0].decode("latin-1", errors="replace")
-            parts = first_line.split(" ")
-            if len(parts) < 3:
-                client_sock.close()
-                return
-
-            method, target_uri, proto = parts[0].upper(), parts[1], parts[2]
-            
-            dest_host = ""
-            dest_port = 80
-
-            if method == "CONNECT":
-                # target_uri is host:port
-                if ":" in target_uri:
-                    hp = target_uri.split(":")
-                    dest_host = hp[0]
-                    dest_port = int(hp[1])
-                else:
-                    dest_host = target_uri
-                    dest_port = 443
+            client_sock.settimeout(15)
+            headers, client_tail = read_headers(client_sock)
+            lines = headers[:-4].split(b'\r\n')
+            parts = lines[0].decode('ascii').split(' ')
+            if len(parts) != 3 or parts[2] not in ('HTTP/1.0', 'HTTP/1.1'):
+                raise ValueError('Invalid request line.')
+            method, target, version = parts
+            if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", method):
+                raise ValueError('Invalid request method.')
+            fields = []
+            for line in lines[1:]:
+                key, separator, value = line.partition(b':')
+                if not separator or not re.fullmatch(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+", key):
+                    raise ValueError('Invalid request header.')
+                if b'\r' in value or b'\n' in value or b'\x00' in value:
+                    raise ValueError('Invalid request header value.')
+                if key.lower() not in (b'proxy-authorization', b'proxy-connection'):
+                    fields.append((key, value.strip()))
+            if method == 'CONNECT':
+                host, port = parse_authority(target)
             else:
-                # Normal HTTP request (GET http://host:port/path HTTP/1.1 or GET /path with Host: header)
-                if target_uri.startswith("http://") or target_uri.startswith("https://"):
-                    p = urllib.parse.urlsplit(target_uri)
-                    dest_host = p.hostname
-                    dest_port = p.port or (443 if p.scheme == "https" else 80)
+                parsed = urllib.parse.urlsplit(target)
+                if parsed.scheme:
+                    if parsed.scheme != 'http' or parsed.username is not None or parsed.fragment:
+                        raise ValueError('Use CONNECT for HTTPS destinations.')
+                    host, port = parse_authority(parsed.netloc, 80)
                 else:
-                    for line in lines[1:]:
-                        if line.lower().startswith(b"host:"):
-                            hval = line.split(b":", 1)[1].strip().decode("latin-1")
-                            if ":" in hval:
-                                hp = hval.split(":")
-                                dest_host = hp[0]
-                                dest_port = int(hp[1])
-                            else:
-                                dest_host = hval
-                                dest_port = 80
-                            break
-
-            if not dest_host:
-                client_sock.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-                client_sock.close()
-                return
-
-            # Establish connection to UPSTREAM proxy (FAIL-CLOSED: never bypass upstream)
-            upstream_sock = None
+                    hosts = [v.decode('ascii') for k, v in fields if k.lower() == b'host']
+                    if len(hosts) != 1 or not target.startswith('/'):
+                        raise ValueError('Missing/ambiguous destination host.')
+                    host, port = parse_authority(hosts[0], 80)
+                    parsed = urllib.parse.urlsplit('http://' + authority(host, port) + target)
             try:
-                upstream_sock = socket.create_connection((self.profile.host, self.profile.port), timeout=2.0)
-            except Exception as e:
-                # Return 502 Bad Gateway to client
-                client_sock.sendall(b"HTTP/1.1 502 Bad Gateway (Proxy Unreachable)\r\n\r\n")
-                client_sock.close()
+                upstream = connect_upstream(self.profile)
+                self._track(upstream)
+                if self.profile.is_socks:
+                    if not self._socks5_connect_upstream(upstream, host, port):
+                        raise OSError('SOCKS5 handshake rejected.')
+                    server_tail = b''
+                elif method == 'CONNECT':
+                    server_tail = http_connect(upstream, self.profile, host, port)
+                else:
+                    server_tail = b''
+            except (OSError, ValueError):
+                client_sock.sendall(b'HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
                 return
-
-            # Route through upstream depending on its protocol
-            if self.profile.is_socks:
-                # Upstream is SOCKS5
-                if not self._socks5_connect_upstream(upstream_sock, dest_host, dest_port):
-                    client_sock.sendall(b"HTTP/1.1 502 Bad Gateway (SOCKS5 Handshake Failed)\r\n\r\n")
-                    client_sock.close()
-                    upstream_sock.close()
-                    return
-
-                if method == "CONNECT":
-                    # Tell client HTTP 200 Connection established
-                    client_sock.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
-                else:
-                    # Forward the plain HTTP request bytes to SOCKS5 tunnel
-                    upstream_sock.sendall(req_data)
-
+            if method == 'CONNECT':
+                client_sock.sendall(b'HTTP/1.1 200 Connection established\r\n\r\n' + server_tail)
+                if client_tail:
+                    upstream.sendall(client_tail)
             else:
-                # Upstream is HTTP/HTTPS proxy
-                if method == "CONNECT":
-                    # Send CONNECT to upstream proxy with Proxy-Authorization if required
-                    conn_headers = [f"CONNECT {dest_host}:{dest_port} HTTP/1.1\r\nHost: {dest_host}:{dest_port}\r\n"]
-                    if self.profile.has_auth:
-                        cred = f"{self.profile.username or ''}:{self.profile.password or ''}"
-                        b64 = base64.b64encode(cred.encode("utf-8")).decode("ascii")
-                        conn_headers.append(f"Proxy-Authorization: Basic {b64}\r\n")
-                    conn_headers.append("\r\n")
-                    upstream_sock.sendall("".join(conn_headers).encode("latin-1"))
+                request_target = (parsed.path or '/') + (('?' + parsed.query) if parsed.query else '')
+                if not self.profile.is_socks:
+                    request_target = 'http://' + authority(host, port) + request_target
+                fields = [(k, v) for k, v in fields if k.lower() != b'host']
+                fields.insert(0, (b'Host', authority(host, port).encode('ascii')))
+                lengths = [v for k, v in fields if k.lower() == b'content-length']
+                encodings = [v.lower() for k, v in fields if k.lower() == b'transfer-encoding']
+                if len(lengths) > 1 or len(encodings) > 1 or (lengths and encodings):
+                    raise ValueError('Ambiguous HTTP request framing.')
+                if lengths and (not lengths[0].isdigit() or len(lengths[0]) > 18):
+                    raise ValueError('Invalid Content-Length.')
+                if encodings and encodings != [b'chunked']:
+                    raise ValueError('Unsupported Transfer-Encoding.')
+                expects = [v.lower() for k, v in fields if k.lower() == b'expect']
+                if expects and expects != [b'100-continue']:
+                    raise ValueError('Unsupported Expect header.')
+                fields = [(k, v) for k, v in fields if k.lower() not in (b'connection', b'expect')]
+                fields.append((b'Connection', b'close'))
+                request = f'{method} {request_target} {version}\r\n'.encode('ascii')
+                request += b''.join(k + b': ' + v + b'\r\n' for k, v in fields)
+                if not self.profile.is_socks:
+                    request += proxy_auth_header(self.profile)
+                upstream.sendall(request + b'\r\n')
+                if expects:
+                    client_sock.sendall(b'HTTP/1.1 100 Continue\r\n\r\n')
+                self._forward_http_body(client_sock, upstream, client_tail, lengths, encodings)
+                established = True
+                client_sock.settimeout(None)
+                upstream.settimeout(None)
+                while True:
+                    data = upstream.recv(32768)
+                    if not data:
+                        break
+                    client_sock.sendall(data)
+                return
+            established = True
+            self._pipe_duplex(client_sock, upstream)
+        except (OSError, ValueError, UnicodeError):
+            if not established:
+                try:
+                    client_sock.sendall(b'HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
+                except OSError:
+                    pass
+        finally:
+            for sock in (client_sock, upstream):
+                if sock is not None:
+                    sock.close()
+                    with self._lock:
+                        self._connections.discard(sock)
+            with self._lock:
+                self._workers.discard(threading.current_thread())
 
-                    # Read upstream response
-                    resp_buf = b""
-                    while b"\r\n\r\n" not in resp_buf:
-                        chunk = upstream_sock.recv(4096)
-                        if not chunk: break
-                        resp_buf += chunk
-                    
-                    if b"200 " not in resp_buf:
-                        client_sock.sendall(resp_buf if resp_buf else b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-                        client_sock.close()
-                        upstream_sock.close()
-                        return
-                    
-                    # Notify client 200 OK
-                    client_sock.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
-                else:
-                    # Forward HTTP request with injected Proxy-Authorization
-                    if self.profile.has_auth and b"Proxy-Authorization:" not in req_data:
-                        cred = f"{self.profile.username or ''}:{self.profile.password or ''}"
-                        b64 = base64.b64encode(cred.encode("utf-8")).decode("ascii")
-                        auth_hdr = f"Proxy-Authorization: Basic {b64}\r\n".encode("latin-1")
-                        req_data = req_data.replace(b"\r\n", b"\r\n" + auth_hdr, 1)
-                    upstream_sock.sendall(req_data)
+    @staticmethod
+    def _forward_http_body(client, upstream, prefix, lengths, encodings):
+        # Exactly one HTTP message: pipelined requests cannot leak their proxy
+        # authorization or change destination on an established SOCKS stream.
+        buffered = bytearray(prefix)
 
-            # Bidirectional streaming of raw bytes (end-to-end TLS preserved without decryption)
-            self._pipe_duplex(client_sock, upstream_sock)
+        def take(count):
+            result = bytearray()
+            while len(result) < count:
+                if not buffered:
+                    part = client.recv(min(32768, count - len(result)))
+                    if not part:
+                        raise OSError('Incomplete HTTP body.')
+                    buffered.extend(part)
+                amount = min(count - len(result), len(buffered))
+                result.extend(buffered[:amount])
+                del buffered[:amount]
+            return bytes(result)
 
-        except Exception:
-            try: client_sock.close()
-            except Exception: pass
+        def line():
+            result = bytearray()
+            while not result.endswith(b'\r\n'):
+                if len(result) >= 8192:
+                    raise ValueError('Chunk header exceeds limit.')
+                result.extend(take(1))
+            return bytes(result)
 
-    def _socks5_connect_upstream(self, sock: socket.socket, host: str, port: int) -> bool:
-        """Performs SOCKS5 greeting + auth + CONNECT command."""
+        if encodings:
+            while True:
+                header = line()
+                size_text = header[:-2].split(b';', 1)[0]
+                if not size_text or any(c not in b'0123456789abcdefABCDEF' for c in size_text) or len(size_text) > 16:
+                    raise ValueError('Invalid chunk size.')
+                size = int(size_text, 16)
+                if size == 0:
+                    upstream.sendall(b'0\r\n')
+                    total = 0
+                    while True:
+                        trailer = line()
+                        total += len(trailer)
+                        if total > 65536:
+                            raise ValueError('Trailers exceed limit.')
+                        if trailer == b'\r\n':
+                            upstream.sendall(trailer)
+                            return
+                        name, separator, _ = trailer.partition(b':')
+                        if not separator or not re.fullmatch(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name) or b'\x00' in trailer:
+                            raise ValueError('Invalid trailer.')
+                        if name.lower() not in (b'proxy-authorization', b'proxy-connection', b'connection', b'content-length', b'transfer-encoding', b'host'):
+                            upstream.sendall(trailer)
+                upstream.sendall(header)
+                while size:
+                    data = take(min(size, 32768))
+                    upstream.sendall(data)
+                    size -= len(data)
+                if take(2) != b'\r\n':
+                    raise ValueError('Invalid chunk terminator.')
+                upstream.sendall(b'\r\n')
+        else:
+            size = int(lengths[0]) if lengths else 0
+            while size:
+                data = take(min(size, 32768))
+                upstream.sendall(data)
+                size -= len(data)
+
+    def _socks5_connect_upstream(self, sock, host, port):
         try:
-            sock.settimeout(10.0)
-            if self.profile.has_auth:
-                sock.sendall(b"\x05\x02\x00\x02")
-            else:
-                sock.sendall(b"\x05\x01\x00")
-            
-            resp = sock.recv(2)
-            if len(resp) < 2 or resp[0] != 0x05:
-                return False
-            
-            auth_method = resp[1]
-            if auth_method == 0x02:
-                user_b = (self.profile.username or "").encode("utf-8")
-                pwd_b = (self.profile.password or "").encode("utf-8")
-                req = bytearray([0x01, len(user_b)]) + user_b + bytearray([len(pwd_b)]) + pwd_b
-                sock.sendall(req)
-                auth_resp = sock.recv(2)
-                if len(auth_resp) < 2 or auth_resp[1] != 0x00:
-                    return False
-            elif auth_method != 0x00:
-                return False
-
-            # CONNECT by domain name (0x03)
-            hb = host.encode("utf-8")
-            pb = port.to_bytes(2, byteorder="big")
-            cmd = bytearray([0x05, 0x01, 0x00, 0x03, len(hb)]) + hb + pb
-            sock.sendall(cmd)
-
-            conn_resp = sock.recv(4)
-            if len(conn_resp) < 4 or conn_resp[1] != 0x00:
-                return False
-            
-            atyp = conn_resp[3]
-            if atyp == 0x01: sock.recv(4 + 2)
-            elif atyp == 0x03:
-                dlen = sock.recv(1)[0]
-                sock.recv(dlen + 2)
-            elif atyp == 0x04: sock.recv(16 + 2)
-            
+            socks5_connect(sock, self.profile, host, port)
             return True
-        except Exception:
+        except (OSError, ValueError):
             return False
 
-    def _pipe_duplex(self, sock1: socket.socket, sock2: socket.socket):
-        """High-performance duplex forwarding between sockets using select."""
-        sockets = [sock1, sock2]
-        try:
-            sock1.setblocking(False)
-            sock2.setblocking(False)
-            while True:
-                r, _, _ = select.select(sockets, [], sockets, 30.0)
-                if not r:
-                    break
-                for s in r:
-                    other = sock2 if s is sock1 else sock1
-                    data = s.recv(32768)
-                    if not data:
-                        return
-                    other.sendall(data)
-        except Exception:
-            pass
-        finally:
-            try: sock1.close()
-            except Exception: pass
-            try: sock2.close()
-            except Exception: pass
+    def _pipe_duplex(self, first, second):
+        """One I/O owner, bounded queues, partial writes, TLS readiness, half-close."""
+        peers = {first: second, second: first}
+        queued = {first: bytearray(), second: bytearray()}
+        pending = {first: b'', second: b''}
+        readable = {first: True, second: True}
+        half_closed = set()
+        read_wants_write, write_wants_read = set(), set()
+        last_activity = time.monotonic()
+        for sock in peers:
+            sock.setblocking(False)
+        while any(readable.values()) or any(queued.values()) or any(pending.values()):
+            reads, writes = [], []
+            for sock, peer in peers.items():
+                if readable[sock] and len(queued[peer]) < 1024 * 1024:
+                    (writes if sock in read_wants_write else reads).append(sock)
+                if pending[sock] or queued[sock]:
+                    (reads if sock in write_wants_read else writes).append(sock)
+                if not readable[peer] and not queued[sock] and not pending[sock] and sock not in half_closed:
+                    try:
+                        sock.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+                    half_closed.add(sock)
+            r, w, _ = select.select(reads, writes, [], 0.2)
+            for sock in peers:
+                if isinstance(sock, ssl.SSLSocket) and sock.pending() and readable[sock] and len(queued[peers[sock]]) < 1024 * 1024:
+                    if sock not in r:
+                        r.append(sock)
+            for sock in peers:
+                can_write = sock in (r if sock in write_wants_read else w)
+                if can_write and (pending[sock] or queued[sock]):
+                    if not pending[sock]:
+                        pending[sock] = bytes(queued[sock][:32768])
+                        del queued[sock][:len(pending[sock])]
+                    try:
+                        sent = sock.send(pending[sock])
+                        if sent == 0:
+                            raise OSError('Socket stopped accepting data.')
+                        pending[sock] = pending[sock][sent:]
+                        write_wants_read.discard(sock)
+                        last_activity = time.monotonic()
+                    except ssl.SSLWantReadError:
+                        write_wants_read.add(sock)
+                    except (ssl.SSLWantWriteError, BlockingIOError):
+                        write_wants_read.discard(sock)
+                can_read = sock in (w if sock in read_wants_write else r)
+                if can_read and readable[sock] and len(queued[peers[sock]]) < 1024 * 1024:
+                    try:
+                        data = sock.recv(32768)
+                        if data:
+                            queued[peers[sock]].extend(data)
+                            last_activity = time.monotonic()
+                        else:
+                            readable[sock] = False
+                        read_wants_write.discard(sock)
+                    except ssl.SSLWantWriteError:
+                        read_wants_write.add(sock)
+                    except (ssl.SSLWantReadError, BlockingIOError):
+                        read_wants_write.discard(sock)
+            if self.idle_timeout is not None and time.monotonic() - last_activity >= self.idle_timeout:
+                return

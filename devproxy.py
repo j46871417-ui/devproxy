@@ -8,6 +8,10 @@ Universal IDE & Dev Tools Proxy Connection Manager.
 import sys
 import os
 
+if sys.version_info < (3, 11):
+    print('Python 3.11 or newer is required.', file=sys.stderr)
+    raise SystemExit(2)
+
 # Ensure package root is in sys.path
 script_dir = os.path.dirname(os.path.abspath(__file__))
 if script_dir not in sys.path:
@@ -16,4 +20,4 @@ if script_dir not in sys.path:
 from devproxy_pkg.cli import main
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

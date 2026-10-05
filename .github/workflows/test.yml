@@ -1,0 +1,31 @@
+name: Tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.11', '3.14']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -r requirements-test.txt
+      - run: python -m unittest discover -s tests -v
+        env:
+          DEVPROXY_NATIVE_SECRET_TEST: '1'
+      - run: python devproxy.py --version
+      - run: python devproxy.py --help
+      - name: Unix launcher syntax
+        if: runner.os == 'Linux'
+        run: |
+          bash -n devproxy install.sh
+          ./devproxy --version

@@ -55,33 +55,49 @@ def test_ip_echo(profile: ProxyProfile, service_name: str = "Cloudflare Trace", 
     Explicitly discloses the target recipient.
     Uses LocalTunnel for SOCKS/auth upstreams.
     """
-    import urllib.request
+    import http.client
+    import ssl
+    import urllib.parse
+    from .transport import http_connect
     from .tunnel import LocalTunnel
     
     tunnel = None
     try:
-        if profile.is_socks or profile.has_auth:
-            tunnel = LocalTunnel(profile)
-            port = tunnel.start()
-            proxy_url = f"http://127.0.0.1:{port}"
-        else:
-            proxy_url = profile.to_url()
-
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({
-            'http': proxy_url,
-            'https': proxy_url
-        }))
-        req = urllib.request.Request(service_url, headers={"User-Agent": "devproxy/2.0"})
-        with opener.open(req, timeout=6.0) as resp:
-            data = resp.read().decode("utf-8", errors="ignore")
+        parsed = urllib.parse.urlsplit(service_url)
+        if parsed.scheme != 'https' or not parsed.hostname or parsed.username is not None or parsed.fragment:
+            raise ValueError('IP diagnostic requires a credential-free HTTPS URL.')
+        tunnel = LocalTunnel(profile)
+        port = tunnel.start()
+        host, target_port = parsed.hostname, parsed.port or 443
+        context = ssl.create_default_context()
+        if profile.ca_file:
+            context.load_verify_locations(cafile=profile.ca_file)
+        with socket.create_connection(('127.0.0.1', port), timeout=10) as connection:
+            if http_connect(connection, ProxyProfile('echo', 'http', '127.0.0.1', port), host, target_port):
+                raise OSError('Unexpected bytes before target TLS.')
+            with context.wrap_socket(connection, server_hostname=host) as target:
+                path = (parsed.path or '/') + (('?' + parsed.query) if parsed.query else '')
+                target.sendall(('GET ' + path + ' HTTP/1.1\r\nHost: ' + parsed.netloc + '\r\nUser-Agent: devproxy/2.0.1\r\nConnection: close\r\n\r\n').encode('ascii'))
+                response = http.client.HTTPResponse(target)
+                response.begin()
+                if response.status != 200:
+                    raise OSError('IP diagnostic returned HTTP ' + str(response.status))
+                raw = response.read(65537)
+                if len(raw) > 65536:
+                    raise ValueError('IP diagnostic response exceeds limit.')
+                data = raw.decode('utf-8')
             ip = None
             for line in data.splitlines():
                 if line.startswith("ip="):
                     ip = line.split("=", 1)[1]
+            if ip is None:
+                raise ValueError('IP diagnostic response has no egress address.')
+            import ipaddress
+            ipaddress.ip_address(ip)
             return {
                 "service": service_name,
                 "url": service_url,
-                "egress_ip": ip or "detected",
+                "egress_ip": ip,
                 "success": True
             }
     except Exception as e:

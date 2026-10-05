@@ -1,131 +1,123 @@
-# DevProxy 2.0 ⚡
+# DevProxy 2.0.1
 
-> **Универсальный и безопасный менеджер подключения IDE и инструментов разработки через собственный прокси пользователя.**  
-> Поддержка: **Google Antigravity, VS Code, Cursor, Windsurf, VSCodium, OpenCode, Codex CLI и Codex Desktop (GUI)**.  
-> Кроссплатформенно: Windows, macOS, Linux.
+DevProxy запускает приложения через HTTP, HTTPS или SOCKS5-прокси. Локальный HTTP-мост на `127.0.0.1` выполняет авторизацию на upstream, поэтому приложение получает адрес без логина и пароля. Для HTTPS-прокси проверяется его сертификат. TLS между приложением и конечным сервисом остаётся сквозным.
 
-[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-brightgreen.svg)]()
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Security: Audited](https://img.shields.io/badge/Security-OS%20Keyring%20%7C%20Fail--Closed-blue.svg)]()
+Целевые ОС: Windows и Linux. Python-ядро требует Python 3.11+. Автономные сборки создаются одним workflow из этого же ядра. Старые EXE и независимая C#-реализация удалены. macOS-адаптеры оставлены для экспериментальной проверки; отдельный macOS-релиз не заявлен.
 
----
+## Windows
 
-## 🎯 Ключевые возможности
+Распакуйте portable ZIP и запустите `devproxy.exe`. Введите URL прокси в скрытом вводе и выберите приложение. Для запуска из исходников:
 
-1. **Главный сценарий: собственный прокси**:
-   - Пользователь вставляет свой собственный прокси (HTTP, HTTPS, SOCKS5, SOCKS5h).
-   - Утилита проверяет соединение (TCP пинг, авторизация прокси, доступ к AI-провайдерам без автоматического слива IP).
-   - Сохраняет именованный профиль в защищенном хранилище.
-   - Запускает выбранное приложение через изолированный профиль (Режим сессии по умолчанию) либо применяет постоянные настройки по выбору.
-2. **Безопасность первого класса**:
-   - 🔒 **Строгий TLS всегда включен**: Никаких `proxyStrictSSL=false`, `NODE_TLS_REJECT_UNAUTHORIZED=0` или `--ignore-certificate-errors`.
-   - 🛡️ **Защищенное хранение паролей**: Пароли сохраняются только в платформенном защищенном хранилище: **Windows Credential Manager / DPAPI**, **macOS Keychain**, **Linux Secret Service**. В конфигурационные файлы, переменные окружения, логи или консольный вывод открытые пароли никогда не попадают.
-   - 🚫 **Fail-Closed**: При обрыве или ошибке прокси локальный мост не сбрасывает трафик в прямой незащищенный интернет (возвращается 502/504 Bad Gateway).
-   - 📦 **Никакого MitM**: Трафик между приложением и AI-провайдером (Google, OpenAI, Anthropic) передается сквозными зашифрованными TLS-байтами без чтения промптов, токенов или подмены ответов.
-3. **Модульная архитектура адаптеров**:
-   - `ProxyProfile`: Валидация и нормализация URL, IPv6 `[::1]`, URL-encoded спецсимволов.
-   - `SecretStore`: Платформенное шифрование учетных данных.
-   - `ProxyValidator`: Пошаговое тестирование канала.
-   - `ApplicationAdapter`: Индивидуальные адаптеры для Antigravity, VS Code, Cursor, Windsurf, VSCodium, OpenCode, Codex CLI, Codex GUI.
-   - `Launcher`: Безопасный запуск процессов (без `shell=True`).
-   - `ConfigEditor`: Бережное редактирование JSONC/TOML с сохранением комментариев и атомарной записью.
-   - `Tunnel`: Локальный петлевой мост (loopback `127.0.0.1`) для прозрачного SOCKS5/HTTP подключения.
-   - `Recovery`: Точный откат только внесенных утилитой изменений.
-
----
-
-## 🚀 Быстрый старт
-
-### Интерактивный мастер (простейший путь):
-```bash
+```powershell
 python devproxy.py
-# или в Windows:
-devproxy.exe
-# или в Linux / macOS:
-./devproxy
+python devproxy.py --version
 ```
-Мастер проведет по шагам:  
-**«Вставить свой прокси → проверить → выбрать приложение → запустить»**.
 
----
+Чтобы сохранить профиль, выполните следующую команду: URL будет запрошен без отображения на экране.
 
-## 💻 Команды CLI
+```powershell
+.\devproxy.exe profile add --name work
+.\devproxy.exe test --profile work
+.\devproxy.exe run antigravity --profile work
+.\devproxy.exe run cursor --profile work
+.\devproxy.exe run vscode --profile work
+.\devproxy.exe run codex --profile work
+.\devproxy.exe run opencode --profile work
+.\devproxy.exe run claude --profile work
+```
 
-### 1. Управление профилями
+В исходниках замените `.\devproxy.exe` на `python devproxy.py`. `claude` означает Claude Code CLI. Для Codex Desktop есть отдельный экспериментальный ID `codex-gui`.
+
+Секрет профиля хранится в Windows Credential Manager; при недоступном vault используется шифрование DPAPI текущего пользователя. Пароли не записываются в state.json. Копирование профиля на другой компьютер/ОС не переносит доступ к секрету: добавьте его заново там.
+
+## Linux
+
+В распакованном исходном архиве:
+
 ```bash
-# Добавить профиль со своим прокси
-python devproxy.py profile add "socks5://user:password@1.2.3.4:10808" --name mynode
-python devproxy.py profile add "http://1.2.3.4:8080" --name office
-
-# Просмотреть сохраненные профили (секреты надежно замаскированы)
-python devproxy.py profile list
-
-# Удалить профиль
-python devproxy.py profile remove mynode
+python3 install.py --from-checkout
+export PATH="$HOME/.local/bin:$PATH"
+devproxy --version
+devproxy
 ```
 
-### 2. Проверка соединения
+Установщик размещает весь пакет в `~/.local/lib/devproxy`, создаёт лаунчер в `~/.local/bin` и не редактирует `.bashrc`/`.zshrc`. Для установки из ZIP:
+
 ```bash
-# Проверить профиль
-python devproxy.py test --profile mynode
-
-# Проверить ad-hoc прокси без сохранения
-python devproxy.py test --proxy "socks5://127.0.0.1:10808"
-
-# Опциональная проверка исходящего внешнего IP (с явным указанием целевого хоста)
-python devproxy.py test --profile mynode --echo
+python3 install.py --archive devproxy-source-2.0.1.zip --sha256 EXPECTED_SHA256
 ```
 
-### 3. Список приложений
+После публикации тега `v2.0.1` также доступна загрузка фиксированного тега через `python3 install.py --version v2.0.1`. До публикации тега используйте локальный архив или checkout.
+
+Для сохранения пароля требуется доступный Secret Service и `secret-tool` (обычно пакет `libsecret-tools`). На headless Linux без vault пароль можно использовать только в текущей сессии: запустите `devproxy` и введите URL скрыто либо подайте его через `--proxy-stdin`. Программа не объявляет пароль сохранённым, если secure backend недоступен.
+
+## Сессии и отдельный мост
+
+GUI запускается с отдельным каталогом данных DevProxy, чтобы уже открытая обычная IDE не перехватила запуск со старым окружением. При первом запуске может потребоваться повторный вход в IDE. Можно выбрать свой каталог через `--user-data-dir`. Повторная одновременная сессия с тем же каталогом отклоняется. Если launcher аварийно завершился и оставил `.devproxy-session.lock`, сначала закройте соответствующую IDE, затем удалите этот lock.
+
+**Терминал DevProxy должен оставаться открытым.** Если launcher IDE завершился раньше окна, DevProxy продолжает обслуживать мост. Закройте IDE и нажмите Ctrl+C для завершения сессии. На Windows процессам назначается Job Object, на Linux — отдельная группа процессов. Уже запущенные сторонние workers могут потребовать отдельного перезапуска.
+
+```text
+devproxy run codex --profile work -- exec "Ответь одним словом OK"
+devproxy run claude --profile work -- --help
+devproxy exec --profile work -- COMMAND ARGUMENTS
+devproxy serve --profile work --port 18080
+```
+
+`serve` позволяет отдельно держать мост `http://127.0.0.1:18080`. Запускаемые после настройки приложения могут использовать его в HTTP_PROXY/HTTPS_PROXY. На loopback логин и пароль не нужны; доступ к нему имеют локальные процессы вашего компьютера. Прокси не является механизмом изоляции от других локальных пользователей.
+
 ```bash
-python devproxy.py apps list
-```
-Показывает установленные на компьютере среды разработки (`antigravity`, `vscode`, `cursor`, `windsurf`, `vscodium`, `opencode`, `codex`, `codex-gui`) и пути к их исполняемым файлам.
-
-### 4. Режим сессии (Запуск без изменения системных настроек)
-```bash
-# Запустить Google Antigravity через профиль mynode
-python devproxy.py run antigravity --profile mynode
-
-# Запустить Cursor с передачей дополнительных аргументов рабочей директории
-python devproxy.py run cursor --profile mynode -- .
-
-# Запустить Codex CLI
-python devproxy.py run codex --profile mynode
+export HTTP_PROXY=http://127.0.0.1:18080
+export HTTPS_PROXY=http://127.0.0.1:18080
 ```
 
-### 5. Постоянная настройка (Persistent) и Откат (Recovery)
-```bash
-# Применить настройки к выбранному приложению
-python devproxy.py apply --app antigravity --profile mynode
-python devproxy.py apply --app vscode,cursor --profile mynode
+Дочерним процессам задаются uppercase и lowercase HTTP_PROXY/HTTPS_PROXY/ALL_PROXY. Существующий NO_PROXY сохраняется и дополняется loopback. Чтобы оставить только loopback, используйте `--no-proxy ""` в `run`/`exec`. Внешние браузеры OAuth и программы, игнорирующие эти переменные, требуют собственной настройки. DevProxy не устанавливает firewall/VPN и не обещает перехватить все сетевые запросы машины.
 
-# Безопасный откат настроек приложения к исходным
-python devproxy.py restore --app antigravity
-python devproxy.py restore --app vscode,cursor
+## Протоколы, сертификаты и диагностика
+
+Принимаются `http://host:port`, `https://host:port`, `socks5://host:port`, `socks5h://host:port`, URL с percent-encoded credentials, `host:port[:user:password]` и bracketed IPv6. Порт 0, неправильный host, управляющие символы, path/query/fragment отклоняются. `socks5` разрешает имена локально; `socks5h` передаёт их proxy-серверу.
+
+```text
+devproxy test --profile work
+devproxy test --profile work --targets api.openai.com,api.anthropic.com --json
+devproxy test --profile work --ca-file /path/to/trusted-ca.pem
+devproxy test --profile work --echo
+devproxy run cursor --profile work --dry-run
+devproxy status
+devproxy detect
 ```
 
-### 6. Дополнительно: Поиск локальных клиентов
-```bash
-python devproxy.py detect
-python devproxy.py detect --save
+`test` проверяет TCP, CONNECT и строгий TLS ко **всем** выбранным endpoints. Это не проверка API-ключа, подписки, AI-ответа или конкретного extension host. `--echo` отдельно разрешает запрос к Cloudflare Trace для определения исходящего IP. CA добавляется к системным доверенным сертификатам; insecure-режима нет.
+
+Если upstream возвращает 403/407/502, исправьте доступ/авторизацию у своего proxy-провайдера. DevProxy не переключается на прямой маршрут. Для OpenCode проверьте также `models.dev` и выбранного провайдера. При запрещённой загрузке каталога поддерживаемые версии OpenCode имеют `OPENCODE_DISABLE_MODELS_FETCH=1` для отключения обновления каталога; это не открывает доступ к заблокированному AI-сервису. [Документация OpenCode](https://dev.opencode.ai/docs/cli/).
+
+## Постоянные изменения и восстановление
+
+Persistent поддерживается только для JSONC-настроек VS Code-family/Antigravity с **неавторизованным HTTP/HTTPS-прокси**. Для authenticated/SOCKS-прокси используйте `run` или `serve`. В OpenCode, Codex и Claude не создаются вымышленные поля `proxy`.
+
+```text
+devproxy apply --app vscode --proxy http://127.0.0.1:18080 --config-path /path/to/settings.json --dry-run
+devproxy apply --app vscode --proxy http://127.0.0.1:18080 --config-path /path/to/settings.json
+devproxy restore --app vscode --dry-run
+devproxy restore --app vscode
 ```
-*(Функция исключительно по запросу: никогда не запускается автоматически и не меняет введенный адрес без подтверждения).*
 
----
+Без `--config-path` выбирается единственный существующий config; при нескольких/отсутствующих файлах нужна явная цель. Profiles/Portable/Insiders можно выбрать через `--config-path`; XDG_CONFIG_HOME учитывается. Сначала проверяются все цели, сохраняется журнал, затем выполняются записи. Ошибки видны в exit code. Первый `.bak` не перезаписывается. Ручные изменения proxy-полей вызывают конфликт: restore не уничтожает их и сохраняет журнал.
 
-## 📊 Матрица поддержки
+Старые recovery records версии 2.0.0 без applied values не восстанавливаются автоматически: невозможно надёжно отличить ручные изменения. Сохраните state.json и `.bak`, сравните их с текущими настройками и восстановите нужные поля вручную. Утилита не очищает такой журнал под видом успешного restore.
 
-Подробная матрица интеграции **Приложение × ОС × Способ подключения** доступна в [MATRIX.md](MATRIX.md).
+Старые `--status` и `--remove` сопоставлены с `status` и `restore --app all`. Одиночный proxy URL запускает выбор приложения для сессии и больше не меняет глобальные Git/env-настройки всех программ.
 
----
+## Разработка и выпуск
 
-## 🛡️ Безопасность и проверка подлинности сборок
+```text
+python -m pip install -r requirements-test.txt
+python -m unittest discover -s tests -v
+python -m pip install -r requirements-build.txt
+python -m PyInstaller --onefile --clean --name devproxy devproxy.py
+python scripts/package_release.py --name devproxy-windows-x86_64 --output release
+```
 
-- Исходный код C# скомпилирован через официальный компилятор платформы.
-- Контрольная сумма `devproxy.exe`:
-  - **SHA-256**: `D1104B97008E7E7EBD3A329109BF4CFFF616B0CC6E210429A50F0AADE383794A`
-- Запуск тестов:
-  ```bash
-  python -m unittest discover -s tests -p "test_*.py"
-  ```
+Сетевые тесты используют только loopback и тестовые credentials. Тестовый CA создаётся на время теста, ключи не публикуются. Нативные Windows vault/DPAPI-тесты включаются через `DEVPROXY_NATIVE_SECRET_TEST=1` и используют уникальные временные записи с удалением. Linux/macOS vault требуют самостоятельной проверки в пользовательской desktop-сессии.
+
+PR-CI проверяет Windows/Linux и Python 3.11/3.14 и собирает оба portable ZIP. Linux binary собирается на Ubuntu 22.04 для x86_64; для старых дистрибутивов и musl/Alpine используйте Python-исходники. Tag workflow проверяет тесты и версию frozen EXE, затем создаёт portable ZIP и SHA-256; GitHub release создаётся черновиком. Публикация результатов CI не равна проверке каждой версии IDE: реальные ограничения перечислены в [MATRIX.md](MATRIX.md).

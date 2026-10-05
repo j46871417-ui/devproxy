@@ -36,6 +36,23 @@ class VSCodeFamilyAdapter(ApplicationAdapter):
         return ["win32", "darwin", "linux"]
 
     def detect_executable(self) -> Optional[str]:
+        if sys.platform == 'win32':
+            executable = {'vscode': 'Code.exe', 'cursor': 'Cursor.exe', 'windsurf': 'Windsurf.exe',
+                          'vscodium': 'VSCodium.exe', 'antigravity': 'Antigravity.exe'}.get(self.app_id, self._bin_names[-1] + '.exe')
+            folders = [self._folder_name, self._display_name]
+            if self.app_id == 'vscode':
+                folders.insert(0, 'Microsoft VS Code')
+            for base in (os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Programs'),
+                         os.environ.get('ProgramFiles', r'C:\Program Files')):
+                for folder in folders:
+                    candidate = os.path.join(base, folder, executable)
+                    if os.path.isfile(candidate):
+                        return candidate
+        if sys.platform == 'darwin':
+            for binary in ('Electron', self._folder_name):
+                candidate = f'/Applications/{self._display_name}.app/Contents/MacOS/{binary}'
+                if os.path.isfile(candidate):
+                    return candidate
         # Check PATH first
         for b in self._bin_names:
             p = shutil.which(b)
@@ -85,81 +102,50 @@ class VSCodeFamilyAdapter(ApplicationAdapter):
         else:
             home = os.path.expanduser("~")
             return [
-                os.path.join(home, ".config", self._folder_name, "User", "settings.json"),
+                os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.join(home, ".config")), self._folder_name, "User", "settings.json"),
                 # Flatpak path
-                os.path.expanduser(f"~/.var/app/com.visualstudio.{self._bin_names[0]}/config/{self._folder_name}/User/settings.json")
+                os.path.expanduser(f"~/.var/app/{self.flatpak_id()}/config/{self._folder_name}/User/settings.json")
             ]
 
+    def flatpak_id(self):
+        return {"vscode": "com.visualstudio.code", "vscodium": "com.vscodium.codium"}.get(self.app_id, self.app_id)
+
     def get_cli_launch_flags(self, profile: ProxyProfile) -> List[str]:
-        return ["--proxy-server={PROXY_URL}"]
+        return ["--proxy-server={PROXY_URL}", "--disable-quic", "--new-window"]
 
-    def apply_persistent(self, profile: ProxyProfile) -> Tuple[bool, str]:
-        configs = self.detect_config_files()
-        target_path = configs[0]
-        parsed, raw = ConfigEditor.load_jsonc(target_path)
-        if parsed is None:
-            return False, f"Failed to parse JSONC in {target_path}. File may contain syntax errors."
+    session_gui = True
 
-        proxy_url = profile.to_safe_url() if profile.has_auth else profile.to_url()
-        orig_proxy = parsed.get("http.proxy")
-        orig_support = parsed.get("http.proxySupport")
+    def persistent_plan(self, profile, config_path=None):
+        if profile.has_auth or profile.is_socks:
+            raise ValueError("Authenticated and SOCKS proxies require session mode; use devproxy run.")
+        candidates = list(dict.fromkeys(os.path.abspath(p) for p in self.detect_config_files()))
+        existing = [p for p in candidates if os.path.exists(p)]
+        if config_path:
+            target = os.path.abspath(os.path.expanduser(config_path))
+        elif len(existing) == 1:
+            target = existing[0]
+        elif len(existing) > 1:
+            raise ValueError("Multiple settings files found; select --config-path explicitly.")
+        else:
+            raise ValueError("No settings file found; select --config-path explicitly to create one.")
+        return self.app_id, target, {"http.proxy": profile.to_url(False), "http.proxySupport": "on"}
 
-        updates = {
-            "http.proxy": proxy_url,
-            "http.proxySupport": "on"
-            # Strict SSL remains unmodified (never disabled)
-        }
-
-        StateManager.record_applied_change(
-            self.app_id,
-            target_path,
-            updates,
-            {"http.proxy": orig_proxy, "http.proxySupport": orig_support}
-        )
-
-        new_content = ConfigEditor.update_json_fields_preserving(raw, updates)
+    def apply_persistent(self, profile):
+        from ..core.recovery import apply_json_batch
         try:
-            ConfigEditor.atomic_write(target_path, new_content)
-            return True, f"Configured {target_path}"
-        except Exception as e:
-            return False, str(e)
+            plan = self.persistent_plan(profile)
+            apply_json_batch([plan])
+            return True, "Configured " + plan[1]
+        except (OSError, ValueError, RuntimeError) as error:
+            return False, str(error)
 
-    def restore_persistent(self) -> Tuple[bool, str]:
-        record = StateManager.get_applied_record(self.app_id)
-        if not record:
-            return False, f"No persistent changes recorded for {self.display_name}"
-
-        messages = []
-        for file_path, data in record.items():
-            if not os.path.exists(file_path):
-                continue
-            parsed, raw = ConfigEditor.load_jsonc(file_path)
-            if parsed is None:
-                continue
-
-            orig_values = data.get("original_values", {})
-            keys_to_remove = []
-            updates = {}
-            for k, v in orig_values.items():
-                if v is None:
-                    keys_to_remove.append(k)
-                else:
-                    updates[k] = v
-
-            content = raw
-            if keys_to_remove:
-                content = ConfigEditor.remove_json_fields_preserving(content, keys_to_remove)
-            if updates:
-                content = ConfigEditor.update_json_fields_preserving(content, updates)
-
-            try:
-                ConfigEditor.atomic_write(file_path, content)
-                messages.append(f"Restored {file_path}")
-            except Exception as e:
-                messages.append(f"Error {file_path}: {e}")
-
-        StateManager.clear_applied_record(self.app_id)
-        return True, "; ".join(messages)
+    def restore_persistent(self):
+        from ..core.recovery import restore_json_batch
+        try:
+            restore_json_batch([self.app_id])
+            return True, "Original settings restored."
+        except (OSError, ValueError, RuntimeError) as error:
+            return False, str(error)
 
     def get_limitations(self) -> List[str]:
         return [
@@ -191,7 +177,7 @@ class WindsurfAdapter(VSCodeFamilyAdapter):
 
     def get_limitations(self) -> List[str]:
         lim = super().get_limitations()
-        lim.append("Windsurf utilizes Codeium language server daemon; session launch ensures daemon inherits tunnel.")
+        lim.append("Windsurf utilizes Codeium language server daemon; background daemons may retain an older environment; restart them for the session.")
         return lim
 
 
