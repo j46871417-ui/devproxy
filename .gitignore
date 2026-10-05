@@ -1,13 +1,15 @@
-# Binaries
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.spec
+*.exe
+.coverage
 *.bak
 *.pdb
 *.tmp
 *.tar.gz
-
-# Python
-__pycache__/
-*.pyc
-
-# OS
 Thumbs.db
 .DS_Store
+tests/tmp*/

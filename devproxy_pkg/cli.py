@@ -1,491 +1,413 @@
-"""
-CLI Interface for DevProxy v2.0.0.
-Implements commands:
-- devproxy profile add [URL] [--name NAME]
-- devproxy profile list
-- devproxy profile remove NAME
-- devproxy apps list
-- devproxy test [--profile NAME] [--app TARGET] [--echo]
-- devproxy run TARGET [--profile NAME] [--dry-run] [-- APP_ARGS...]
-- devproxy apply --app TARGET [--profile NAME]
-- devproxy restore --app TARGET
-- devproxy detect
-- devproxy status
-- interactive wizard: "Insert proxy -> Test -> Select App -> Run/Apply"
-"""
-
-import sys
-import os
+"""DevProxy command line. All commands return meaningful exit codes."""
 import argparse
-import subprocess
-from typing import List, Optional
-
-if sys.platform == "win32":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
-
+import difflib
+import getpass
+import hashlib
+import json
+import os
+import re
+import sys
+import uuid
+from . import __version__
 from .core.profile import ProxyProfile
-from .core.secrets import SecretStore
-from .core.validator import ProxyValidator
+from .core.secrets import SecretStore, EphemeralStore, credential_key
+from .core.recovery import StateManager, apply_json_batch, restore_json_batch, get_devproxy_state_path
 from .core.launcher import Launcher
-from .core.recovery import StateManager
+from .core.validator import ProxyValidator
+from .core.config_editor import ConfigEditor
 from .core.diagnostics import get_environment_diagnostics, test_ip_echo
-from .adapters import list_adapters, get_adapter
+from .adapters import get_adapter, list_adapters
 from .detector import LocalProxyDetector
 
-
-class Colors:
-    GREEN = "\033[92m"
-    CYAN = "\033[96m"
-    YELLOW = "\033[93m"
-    RED = "\033[91m"
-    BOLD = "\033[1m"
-    RESET = "\033[0m"
+if sys.platform == 'win32':
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(encoding='utf-8', errors='replace')
 
 
-def print_banner():
-    print(f"{Colors.CYAN}{Colors.BOLD}")
-    print("============================================================")
-    print("  DevProxy 2.0.0 — Universal IDE & Dev Tools Proxy Manager  ")
-    print("  Google Antigravity | VS Code | Cursor | Windsurf | Codex  ")
-    print("============================================================")
-    print(f"{Colors.RESET}")
-
-
-def resolve_profile(profile_name: Optional[str] = None, proxy_str: Optional[str] = None) -> Optional[ProxyProfile]:
-    """Resolves profile from name or raw string, injecting password from SecretStore."""
+def resolve_profile(profile_name=None, proxy_str=None):
     if proxy_str:
-        p = ProxyProfile.parse(proxy_str, name=profile_name or "adhoc")
-        if p.password:
-            SecretStore.store_password(p.name, p.username or "", p.password)
-        return p
-
-    name = profile_name or "default"
-    prof_dict = StateManager.get_profile(name)
-    if not prof_dict:
-        # Check if only 1 profile exists
-        all_profs = StateManager.list_profiles()
-        if len(all_profs) == 1:
-            prof_dict = next(iter(all_profs.values()))
-            name = prof_dict["name"]
-
-    if not prof_dict:
+        return ProxyProfile.parse(proxy_str, name=profile_name or 'adhoc')
+    name = profile_name or 'default'
+    data = StateManager.get_profile(name)
+    if not data and profile_name is None:
+        profiles = StateManager.list_profiles()
+        if len(profiles) == 1:
+            data = next(iter(profiles.values()))
+    if not data:
         return None
+    password = None
+    if data.get('requires_password', bool(data.get('username'))):
+        if not data.get('secret_key'):
+            raise ValueError('Re-add this legacy authenticated profile to bind its secret to the correct endpoint.')
+        password = SecretStore.get_password(data['secret_key'], backend=data.get('secret_backend'))
+        if password is None:
+            raise ValueError('Profile secret unavailable. Re-add it with a working OS vault or use --proxy-stdin for this session.')
+    return ProxyProfile.from_dict(data, password=password)
 
-    pwd = SecretStore.get_password(name)
-    return ProxyProfile.from_dict(prof_dict, password=pwd)
+
+def _raw_proxy(args):
+    if getattr(args, 'proxy_stdin', False):
+        if getattr(args, 'proxy', None):
+            raise ValueError('Choose --proxy or --proxy-stdin, not both.')
+        return sys.stdin.readline().rstrip('\r\n')
+    return getattr(args, 'proxy', None)
+
+
+def _profile(args):
+    profile = resolve_profile(getattr(args, 'profile', None), _raw_proxy(args))
+    if profile is None:
+        raise ValueError('Proxy profile not found. Use --profile, --proxy or --proxy-stdin.')
+    if getattr(args, 'ca_file', None):
+        profile.ca_file = os.path.abspath(os.path.expanduser(args.ca_file))
+    return profile
 
 
 def cmd_profile_add(args):
-    raw = args.proxy
-    name = args.name or "default"
     try:
-        profile = ProxyProfile.parse(raw, name=name)
-        if profile.password:
-            backend = SecretStore.store_password(name, profile.username or "", profile.password)
-            print(f"{Colors.GREEN}[✓] Пароль надежно сохранен ({backend}).{Colors.RESET}")
-            # Do not persist plaintext password in JSON state
-            profile.password = None
-
-        StateManager.save_profile(profile.to_dict(include_password=False))
-        print(f"{Colors.GREEN}[✓] Профиль '{name}' успешно сохранен: {profile.to_safe_url()}{Colors.RESET}")
-    except Exception as e:
-        print(f"{Colors.RED}[-] Ошибка добавления профиля: {e}{Colors.RESET}")
+        raw = _raw_proxy(args)
+        if raw is None:
+            raw = getpass.getpass('Proxy URL (hidden): ')
+        profile = ProxyProfile.parse(raw, name=args.name or 'default')
+        previous = StateManager.get_profile(profile.name)
+        # Each profile revision gets its own vault entry: failed state writes
+        # cannot replace credentials referenced by the previous valid profile.
+        key = credential_key(profile) + '-' + uuid.uuid4().hex
+        requires_password = bool(profile.password)
+        backend = None
+        if requires_password:
+            backend = SecretStore.store_password(key, profile.username or '', profile.password)
+            if backend not in ('os_keychain', 'os_dpapi'):
+                EphemeralStore.delete(key)
+                raise RuntimeError('OS credential storage unavailable; profile was not saved. Use --proxy-stdin with run/serve for a session.')
+        data = profile.to_dict()
+        data.update(requires_password=requires_password, secret_key=key if requires_password else None, secret_backend=backend)
+        try:
+            StateManager.save_profile(data)
+        except Exception:
+            if requires_password:
+                SecretStore.delete_password(key)
+            raise
+        old_key = previous.get('secret_key') if previous else None
+        if old_key and old_key != data['secret_key']:
+            if not SecretStore.delete_password(old_key):
+                print('Profile saved, but obsolete vault entry could not be removed.', file=sys.stderr)
+                return 1
+        # Retire the old name-only namespace; resolve never uses it again.
+        SecretStore.delete_password(profile.name)
+        print('Profile saved:', profile.name, profile.to_safe_url())
+        return 0
+    except (ValueError, OSError, RuntimeError) as error:
+        print('Cannot save profile:', str(error), file=sys.stderr)
+        return 1
 
 
 def cmd_profile_list(args):
-    profs = StateManager.list_profiles()
-    if not profs:
-        print("Нет сохраненных профилей. Добавьте командой: devproxy profile add [URL]")
-        return
-    print(f"\n{Colors.BOLD}Сохраненные профили:{Colors.RESET}")
-    for name, data in profs.items():
-        pwd = SecretStore.get_password(name)
-        p = ProxyProfile.from_dict(data, password=pwd)
-        has_sec = "🔒 (с авторизацией)" if p.has_auth else "🌐 (без пароля)"
-        print(f"  • {Colors.CYAN}{name:16}{Colors.RESET}: {p.to_safe_url()} {has_sec}")
-    print()
+    for name, data in StateManager.list_profiles().items():
+        profile = ProxyProfile.from_dict(data)
+        print(name, profile.to_safe_url(), '(vault required)' if data.get('requires_password') else '')
+    return 0
 
 
 def cmd_profile_remove(args):
-    name = args.name
-    SecretStore.delete_password(name)
-    if StateManager.delete_profile(name):
-        print(f"{Colors.GREEN}[✓] Профиль '{name}' удален.{Colors.RESET}")
-    else:
-        print(f"{Colors.YELLOW}[!] Профиль '{name}' не найден.{Colors.RESET}")
+    data = StateManager.get_profile(args.name)
+    if data is None:
+        raise ValueError('Profile not found.')
+    if data.get('secret_key') and not SecretStore.delete_password(data['secret_key']):
+        raise RuntimeError('Vault entry could not be deleted; profile retained.')
+    SecretStore.delete_password(args.name)
+    StateManager.delete_profile(args.name)
+    print('Profile removed:', args.name)
+    return 0
 
 
 def cmd_apps_list(args):
-    print(f"\n{Colors.BOLD}Поддерживаемые приложения:{Colors.RESET}\n")
     for adapter in list_adapters():
-        exe = adapter.detect_executable()
-        status = f"{Colors.GREEN}Установлено ({exe}){Colors.RESET}" if exe else f"{Colors.YELLOW}Не найдено{Colors.RESET}"
-        print(f"  • {Colors.CYAN}{adapter.app_id:14}{Colors.RESET} [{adapter.display_name}] -> {status}")
-    print()
+        if sys.platform not in adapter.supported_os:
+            continue
+        print(adapter.app_id, ':', adapter.display_name, adapter.detect_executable() or '(not found)')
+    return 0
 
 
 def cmd_test(args):
-    profile = resolve_profile(args.profile, args.proxy)
-    if not profile:
-        print(f"{Colors.RED}[-] Профиль не найден. Укажите --profile или строку прокси.{Colors.RESET}")
-        return
-
-    print(f"Тестирование подключения через: {profile.to_safe_url()}")
-    res = ProxyValidator.validate(profile)
-
-    if not res.tcp_reachable:
-        print(f"  {Colors.RED}✗ Хост прокси недоступен по TCP{Colors.RESET}")
-        for err in res.errors:
-            print(f"    {Colors.RED}! {err}{Colors.RESET}")
-        return
-
-    print(f"  {Colors.GREEN}✓ TCP соединение с прокси установлено (пинг: {res.tcp_latency_ms} ms){Colors.RESET}")
-    for t in res.target_checks:
-        if t["success"]:
-            print(f"  {Colors.GREEN}✓ {t['name']:32}: доступен ({t['latency_ms']} ms, TLS OK){Colors.RESET}")
-        else:
-            print(f"  {Colors.RED}✗ {t['name']:32}: ошибка ({t.get('error')}){Colors.RESET}")
-
-    if args.echo:
-        print("\nЗапрос к внешнему сервису диагностики (Cloudflare Trace)...")
-        echo_res = test_ip_echo(profile)
-        if echo_res["success"]:
-            print(f"  {Colors.GREEN}✓ Исходящий IP прокси: {echo_res['egress_ip']}{Colors.RESET}")
-        else:
-            print(f"  {Colors.YELLOW}! Ошибка диагностики IP: {echo_res.get('error')}{Colors.RESET}")
-
-    if res.overall_success:
-        print(f"\n{Colors.GREEN}[✓] Прокси готов к работе!{Colors.RESET}\n")
+    profile = _profile(args)
+    targets = None
+    if args.targets:
+        targets = []
+        for endpoint in args.targets.split(','):
+            from .core.transport import parse_authority
+            host, port = parse_authority(endpoint)
+            targets.append((host, host, port))
+    result = ProxyValidator.validate(profile, targets)
+    if getattr(args, 'json', False):
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
     else:
-        print(f"\n{Colors.RED}[-] Соединение не готово к работе.{Colors.RESET}\n")
+        print('Proxy:', profile.to_safe_url())
+        for entry in result.target_checks:
+            print('OK' if entry['success'] else 'FAIL', entry['name'], entry['error'] or 'strict TLS verified')
+        for error in result.errors:
+            print(error, file=sys.stderr)
+        print('All selected endpoints passed.' if result.overall_success else 'One or more selected endpoints failed.')
+        print('This checks network/TLS access, not account authorization or application internals.')
+    if args.echo:
+        echo = test_ip_echo(profile)
+        print(json.dumps(echo, ensure_ascii=False))
+        return 0 if result.overall_success and echo['success'] else 1
+    return 0 if result.overall_success else 1
 
 
 def cmd_run(args):
-    app_id = args.app
-    adapter = get_adapter(app_id)
-    if not adapter:
-        print(f"{Colors.RED}[-] Неизвестное приложение '{app_id}'. Список: devproxy apps list{Colors.RESET}")
-        return
-
-    exe = adapter.detect_executable()
-    if not exe:
-        print(f"{Colors.RED}[-] Исполняемый файл для '{adapter.display_name}' не найден на компьютере.{Colors.RESET}")
-        return
-
-    profile = resolve_profile(args.profile, args.proxy)
-    if not profile:
-        print(f"{Colors.RED}[-] Не указан прокси-профиль.{Colors.RESET}")
-        return
-
-    print(f"{Colors.CYAN}[+] Запуск {adapter.display_name} через прокси {profile.to_safe_url()} (Режим сессии)...{Colors.RESET}")
+    adapter = get_adapter(args.app)
+    if adapter is None or sys.platform not in adapter.supported_os:
+        raise ValueError('Unknown or unsupported application for this OS.')
+    executable = args.executable or adapter.detect_executable()
+    if not executable:
+        raise ValueError('Application executable not found; select --executable.')
+    profile = _profile(args)
+    directory = None
+    if adapter.session_gui:
+        identity = hashlib.sha256((profile.name + profile.to_url(False)).encode()).hexdigest()[:16]
+        directory = args.user_data_dir or os.path.join(os.path.dirname(get_devproxy_state_path()), 'sessions', adapter.app_id, identity)
+        directory = os.path.abspath(os.path.expanduser(directory))
     flags = adapter.get_cli_launch_flags(profile)
-
     if args.dry_run:
-        print(f"  [Dry-Run] Команда: {exe}")
-        print(f"  [Dry-Run] Флаги: {flags}")
-        print(f"  [Dry-Run] Аргументы: {args.extra_args}")
-        return
+        print('Executable:', executable)
+        print('Arguments:', [f.replace('{PROXY_URL}', 'http://127.0.0.1:<allocated-port>') for f in flags] + args.extra_args)
+        print('Proxy:', profile.to_safe_url(), 'User data:', directory or '(not applicable)')
+        return 0
+    if directory:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+    print('Session proxy:', profile.to_safe_url())
+    if adapter.session_gui:
+        print('A separate IDE profile is used. Keep this terminal open; Ctrl+C ends the proxy session.')
+    for limitation in adapter.get_limitations():
+        print('Scope:', limitation)
+    process, _ = Launcher.launch_with_tunnel(executable, profile, flags, args.extra_args, wait=True,
+                                            keep_alive=adapter.session_gui, user_data_dir=directory, no_proxy=args.no_proxy)
+    return process.returncode
 
+
+def cmd_exec(args):
+    if not args.command:
+        raise ValueError('Use exec -- COMMAND ARGUMENTS.')
+    profile = _profile(args)
+    if args.dry_run:
+        print('Command:', args.command, 'Proxy:', profile.to_safe_url())
+        return 0
+    process, _ = Launcher.launch_with_tunnel(args.command[0], profile, extra_args=args.command[1:], no_proxy=args.no_proxy)
+    return process.returncode
+
+
+def cmd_serve(args):
+    from .core.tunnel import LocalTunnel
+    profile = _profile(args)
+    tunnel = LocalTunnel(profile, bind_port=args.port)
     try:
-        proc, tunnel = Launcher.launch_with_tunnel(
-            executable=exe,
-            profile=profile,
-            adapter_cli_flags=flags,
-            extra_args=args.extra_args,
-            wait=True
-        )
-        print(f"{Colors.GREEN}[✓] Сессия {adapter.display_name} завершена. Локальный туннель остановлен.{Colors.RESET}")
-    except KeyboardInterrupt:
-        print(f"\n{Colors.YELLOW}[!] Сессия прервана пользователем.{Colors.RESET}")
+        port = tunnel.start()
+        print(f'Proxy bridge: http://127.0.0.1:{port}', flush=True)
+        print('Set HTTP_PROXY and HTTPS_PROXY to this address before launching applications. Ctrl+C stops the bridge.', flush=True)
+        import time
+        while True:
+            time.sleep(0.25)
+    finally:
+        tunnel.stop()
+
+
+def _targets(args):
+    names = [s.strip() for s in args.app.split(',') if s.strip()]
+    if not names or len(names) != len(set(names)):
+        raise ValueError('Select distinct application IDs.')
+    adapters = [get_adapter(s) for s in names]
+    if any(a is None or sys.platform not in a.supported_os for a in adapters):
+        raise ValueError('Unknown or unsupported application for this OS.')
+    return adapters
+
+
+def _show_diff(plans):
+    for path, after in plans:
+        from .core.config_editor import parse_jsonc
+        before, _ = ConfigEditor.load_jsonc(path)
+        current = parse_jsonc(after)
+        print('Planned changes:', path)
+        for key in sorted(set(before or {}) | set(current)):
+            if (key in (before or {})) == (key in current) and (before or {}).get(key) == current.get(key):
+                continue
+            def display(data):
+                if key not in data:
+                    return '<missing>'
+                value = data[key]
+                if isinstance(value, str) and '@' in value:
+                    try:
+                        value = ProxyProfile.parse(value).to_safe_url()
+                    except ValueError:
+                        value = '<credentials hidden>'
+                return json.dumps(value, ensure_ascii=False)
+            print(key, ':', display(before or {}), '->', display(current))
 
 
 def cmd_apply(args):
-    app_targets = [x.strip() for x in args.app.split(",") if x.strip()]
-    profile = resolve_profile(args.profile, args.proxy)
-    if not profile:
-        print(f"{Colors.RED}[-] Профиль не найден.{Colors.RESET}")
-        return
-
-    print(f"\n{Colors.CYAN}[+] Применение настроек прокси: {profile.to_safe_url()}{Colors.RESET}")
-    for target in app_targets:
-        adapter = get_adapter(target)
-        if not adapter:
-            print(f"  {Colors.RED}✗ {target:16}: неизвестный адаптер{Colors.RESET}")
-            continue
-
-        ok, msg = adapter.apply_persistent(profile)
-        if ok:
-            print(f"  {Colors.GREEN}✓ {adapter.display_name:16}: успешно ({msg}){Colors.RESET}")
-        else:
-            print(f"  {Colors.RED}✗ {adapter.display_name:16}: ошибка ({msg}){Colors.RESET}")
-    print()
+    adapters, profile = _targets(args), _profile(args)
+    if args.config_path and len(adapters) != 1:
+        raise ValueError('--config-path selects exactly one application.')
+    plans = [a.persistent_plan(profile, args.config_path) for a in adapters]
+    results = apply_json_batch(plans, dry_run=args.dry_run)
+    if args.dry_run:
+        _show_diff(results)
+    else:
+        for path, _ in results:
+            print('Applied:', path)
+    return 0
 
 
 def cmd_restore(args):
-    app_targets = [x.strip() for x in args.app.split(",") if x.strip()]
-    print(f"\n{Colors.YELLOW}[-] Восстановление исходных настроек...{Colors.RESET}")
-    for target in app_targets:
-        adapter = get_adapter(target)
-        if not adapter:
-            print(f"  {Colors.RED}✗ {target:16}: неизвестный адаптер{Colors.RESET}")
-            continue
-
-        ok, msg = adapter.restore_persistent()
-        if ok:
-            print(f"  {Colors.GREEN}✓ {adapter.display_name:16}: восстановлено ({msg}){Colors.RESET}")
-        else:
-            print(f"  {Colors.YELLOW}! {adapter.display_name:16}: {msg}{Colors.RESET}")
-    print()
-
-
-def cmd_detect(args):
-    print(f"\n{Colors.CYAN}[?] Поиск локально запущенных прокси-клиентов...{Colors.RESET}")
-    found = LocalProxyDetector.scan_active_clients()
-    if not found:
-        print("  Активных локальных клиентов не обнаружено на стандартных портах.")
-        return
-
-    print(f"\n{Colors.GREEN}Обнаружены локальные прокси:{Colors.RESET}")
-    for i, c in enumerate(found, 1):
-        url = f"{c['protocol']}://{c['host']}:{c['port']}"
-        print(f"  [{i}] {c['name']} -> {url}")
-
-    if args.save:
-        choice_idx = int(input("\nВыберите номер для сохранения [1..]: ").strip()) - 1
-        if 0 <= choice_idx < len(found):
-            c = found[choice_idx]
-            prof_name = input("Имя профиля [local]: ").strip() or "local"
-            p = ProxyProfile(name=prof_name, protocol=c["protocol"], host=c["host"], port=c["port"])
-            StateManager.save_profile(p.to_dict())
-            print(f"{Colors.GREEN}[✓] Сохранен профиль '{prof_name}'{Colors.RESET}")
+    if args.app == 'all':
+        names = list(StateManager.load_state().get('applied', {}))
+        if not names:
+            print('No recorded changes.')
+            return 0
+    else:
+        names = [a.app_id for a in _targets(args)]
+    results = restore_json_batch(names, dry_run=args.dry_run)
+    if args.dry_run:
+        _show_diff(results)
+    else:
+        for path, _ in results:
+            print('Restored:', path)
+    return 0
 
 
 def cmd_status(args):
-    print(f"\n{Colors.CYAN}{Colors.BOLD}=== СТАТУС DEVPROXY ==={Colors.RESET}")
-    profs = StateManager.list_profiles()
-    print(f"\nПрофилей сохранено: {len(profs)}")
-    for name, data in profs.items():
-        pwd = SecretStore.get_password(name)
-        p = ProxyProfile.from_dict(data, password=pwd)
-        print(f"  • {name:16}: {p.to_safe_url()}")
-
-    print(f"\n{Colors.BOLD}Состояние сред и конфигураций:{Colors.RESET}")
-    for adapter in list_adapters():
-        configs = adapter.detect_config_files()
-        cfg_status = "не найден"
-        for c in configs:
-            if os.path.exists(c):
-                cfg_status = f"на диске ({c})"
-                break
-        applied_rec = StateManager.get_applied_record(adapter.app_id)
-        applied_info = f"{Colors.GREEN}[Применен persistent]{Colors.RESET}" if applied_rec else "[Без persistent изменений]"
-        print(f"  • {adapter.display_name:24}: {cfg_status} {applied_info}")
-
-    print(f"\n{Colors.BOLD}Переменные окружения текущего процесса:{Colors.RESET}")
-    diag = get_environment_diagnostics()
-    for k, v in diag.items():
-        if v != "<not set>":
-            print(f"  • {k:20}: {v}")
-    print()
+    data = {'profiles': {name: ProxyProfile.from_dict(p).to_safe_url() for name, p in StateManager.list_profiles().items()},
+            'applied': {k: list(v) for k, v in StateManager.load_state().get('applied', {}).items()},
+            'environment': get_environment_diagnostics()}
+    print(json.dumps(data, indent=2, ensure_ascii=False))
+    return 0
 
 
-def interactive_wizard():
-    print_banner()
-    while True:
-        print("Главное меню:")
-        print("  [1] Добавить / ввести свой прокси и запустить приложение")
-        print("  [2] Проверить соединение через сохраненный профиль")
-        print("  [3] Применить настройки к выбранному приложению (persistent)")
-        print("  [4] Восстановить (откатить) настройки приложения")
-        print("  [5] Найти запущенный локальный клиент (опционально)")
-        print("  [6] Список профилей и статус системы")
-        print("  [0] Выход")
+def cmd_detect(args):
+    found = LocalProxyDetector.scan_active_clients()
+    print(json.dumps(found, indent=2, ensure_ascii=False))
+    if args.save:
+        index = int(input('Client number (1-based): ')) - 1
+        if not 0 <= index < len(found):
+            raise ValueError('Invalid client selection.')
+        candidate = found[index]
+        profile = ProxyProfile(input('Profile name: ') or 'local', candidate['protocol'], candidate['host'], candidate['port'])
+        StateManager.save_profile(profile.to_dict())
+    return 0
 
+
+def interactive_wizard(initial_proxy=None):
+    from .interactive import InteractiveMenu
+    return InteractiveMenu(initial_proxy).run()
+
+
+def redact_error(message):
+    return re.sub(r'\S*://\S+@\S*|\S+:\S+@\S+', '<credentials hidden>', message)
+
+
+class SafeParser(argparse.ArgumentParser):
+    def error(self, message):
+        super().error(redact_error(message))
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv == ['--status']:
+        argv = ['status']
+    elif argv == ['--remove']:
+        argv = ['restore', '--app', 'all']
+    elif argv and not argv[0].startswith('-') and ':' in argv[0]:
+        # Old shorthand now launches a chosen session instead of modifying every
+        # IDE, Git and global environment. The supplied proxy is not discarded.
         try:
-            choice = input("\nВыберите действие [0-6]: ").strip()
-        except (KeyboardInterrupt, EOFError):
-            break
-
-        if choice == "1":
-            print("\nВставьте строку прокси (например: socks5://127.0.0.1:10808 или http://user:pass@host:port):")
-            try:
-                raw_proxy = input("Прокси: ").strip()
-            except (KeyboardInterrupt, EOFError):
-                break
-            if not raw_proxy:
-                continue
-
-            try:
-                profile = ProxyProfile.parse(raw_proxy, name="custom")
-            except Exception as e:
-                print(f"{Colors.RED}Ошибка формата: {e}{Colors.RESET}\n")
-                continue
-
-            print(f"\nПроверка соединения с {profile.to_safe_url()}...")
-            res = ProxyValidator.validate(profile)
-            if not res.overall_success:
-                print(f"{Colors.YELLOW}Внимание: Прокси не ответил на все тесты.{Colors.RESET}")
-                for err in res.errors:
-                    print(f"  ! {err}")
-                cont = input("Продолжить запуск приложения? [y/N]: ").strip().lower()
-                if cont != 'y':
-                    continue
-            else:
-                print(f"{Colors.GREEN}[✓] Соединение проверено успешно!{Colors.RESET}")
-
-            # Save profile?
-            save = input("Сохранить этот профиль для постоянного использования? [y/N]: ").strip().lower()
-            if save == 'y':
-                pname = input("Имя профиля [myproxy]: ").strip() or "myproxy"
-                profile.name = pname
-                if profile.password:
-                    SecretStore.store_password(pname, profile.username or "", profile.password)
-                StateManager.save_profile(profile.to_dict(include_password=False))
-                print(f"{Colors.GREEN}[✓] Профиль сохранен как '{pname}'.{Colors.RESET}")
-
-            # Choose app
-            print("\nВыберите приложение для запуска:")
-            adapters = list_adapters()
-            for i, a in enumerate(adapters, 1):
-                exe = a.detect_executable()
-                st = "✓ найдено" if exe else "- не найдено"
-                print(f"  [{i}] {a.display_name} ({st})")
-
-            try:
-                app_choice = input(f"Номер приложения [1..{len(adapters)}]: ").strip()
-                app_idx = int(app_choice) - 1
-                if 0 <= app_idx < len(adapters):
-                    sel_adapter = adapters[app_idx]
-                    exe = sel_adapter.detect_executable()
-                    if not exe:
-                        print(f"{Colors.RED}Исполняемый файл для {sel_adapter.display_name} не найден.{Colors.RESET}")
-                        continue
-                    print(f"\n{Colors.CYAN}Запуск {sel_adapter.display_name}...{Colors.RESET}")
-                    flags = sel_adapter.get_cli_launch_flags(profile)
-                    Launcher.launch_with_tunnel(exe, profile, adapter_cli_flags=flags, wait=True)
-            except Exception as e:
-                print(f"Ошибка: {e}")
-
-        elif choice == "2":
-            cmd_test(argparse.Namespace(profile=None, proxy=None, echo=False))
-        elif choice == "3":
-            print("\nДоступные приложения:")
-            for a in list_adapters():
-                print(f"  • {a.app_id} ({a.display_name})")
-            target = input("Введите ID приложения: ").strip()
-            pname = input("Имя профиля [default]: ").strip() or "default"
-            cmd_apply(argparse.Namespace(app=target, profile=pname, proxy=None))
-        elif choice == "4":
-            target = input("Введите ID приложения для отката: ").strip()
-            cmd_restore(argparse.Namespace(app=target))
-        elif choice == "5":
-            cmd_detect(argparse.Namespace(save=True))
-        elif choice == "6":
-            cmd_status(argparse.Namespace())
-        elif choice in ("0", "q", "exit"):
-            break
-
-
-def main():
-    parser = argparse.ArgumentParser(description="DevProxy — Universal IDE & Dev Tools Proxy Manager", add_help=True)
-    subparsers = parser.add_subparsers(dest="subcommand")
-
-    # profile
-    p_prof = subparsers.add_parser("profile", help="Manage proxy profiles")
-    p_prof_sub = p_prof.add_subparsers(dest="profile_action")
-    p_add = p_prof_sub.add_parser("add", help="Add proxy profile")
-    p_add.add_argument("proxy", help="Proxy URL or host:port:user:pass")
-    p_add.add_argument("--name", "-n", default="default", help="Profile name")
-
-    p_list = p_prof_sub.add_parser("list", help="List proxy profiles")
-    p_del = p_prof_sub.add_parser("remove", help="Delete profile")
-    p_del.add_argument("name", help="Profile name to delete")
-
-    # apps
-    p_apps = subparsers.add_parser("apps", help="Application adapters")
-    p_apps_sub = p_apps.add_subparsers(dest="apps_action")
-    p_apps_sub.add_parser("list", help="List supported applications")
-
-    # test
-    p_test = subparsers.add_parser("test", help="Test connectivity")
-    p_test.add_argument("--profile", "-p", help="Profile name")
-    p_test.add_argument("--proxy", help="Ad-hoc proxy URL")
-    p_test.add_argument("--echo", action="store_true", help="Query external IP diagnostic")
-
-    # run
-    p_run = subparsers.add_parser("run", help="Launch application in isolated session")
-    p_run.add_argument("app", help="Target application ID (antigravity, vscode, cursor, codex, etc.)")
-    p_run.add_argument("--profile", "-p", help="Profile name")
-    p_run.add_argument("--proxy", help="Ad-hoc proxy string")
-    p_run.add_argument("--dry-run", action="store_true", help="Show command without launching")
-    p_run.add_argument("extra_args", nargs="*", help="Extra arguments passed to application")
-
-    # apply
-    p_apply = subparsers.add_parser("apply", help="Apply persistent settings")
-    p_apply.add_argument("--app", "-a", required=True, help="App ID or comma-separated list")
-    p_apply.add_argument("--profile", "-p", help="Profile name")
-    p_apply.add_argument("--proxy", help="Ad-hoc proxy string")
-
-    # restore
-    p_restore = subparsers.add_parser("restore", help="Restore original settings")
-    p_restore.add_argument("--app", "-a", required=True, help="App ID or comma-separated list")
-
-    # detect
-    p_det = subparsers.add_parser("detect", help="Scan local proxy clients")
-    p_det.add_argument("--save", action="store_true", help="Offer to save found client as profile")
-
-    # status
-    subparsers.add_parser("status", help="Show current status")
-
-    if len(sys.argv) == 1:
-        interactive_wizard()
-        return
-
-    # Check if first arg is an ad-hoc proxy URL (backward compatibility with devproxy v1)
-    first = sys.argv[1]
-    if first.startswith(("http://", "https://", "socks5://", "socks5h://")) or (":" in first and not first.startswith("-") and first not in ["profile", "apps", "test", "run", "apply", "restore", "detect", "status"]):
-        interactive_wizard()
-        return
-
-    # Split extra args after '--'
-    raw_argv = sys.argv[1:]
-    extra_after_dash = []
-    if "--" in raw_argv:
-        dash_idx = raw_argv.index("--")
-        extra_after_dash = raw_argv[dash_idx + 1:]
-        raw_argv = raw_argv[:dash_idx]
-
-    args = parser.parse_args(raw_argv)
-    if hasattr(args, "extra_args"):
-        args.extra_args = (args.extra_args or []) + extra_after_dash
-
-    if args.subcommand == "profile":
-        if args.profile_action == "add": cmd_profile_add(args)
-        elif args.profile_action == "list": cmd_profile_list(args)
-        elif args.profile_action == "remove": cmd_profile_remove(args)
-        else: p_prof.print_help()
-    elif args.subcommand == "apps":
-        if args.apps_action == "list": cmd_apps_list(args)
-        else: p_apps.print_help()
-    elif args.subcommand == "test":
-        cmd_test(args)
-    elif args.subcommand == "run":
-        cmd_run(args)
-    elif args.subcommand == "apply":
-        cmd_apply(args)
-    elif args.subcommand == "restore":
-        cmd_restore(args)
-    elif args.subcommand == "detect":
-        cmd_detect(args)
-    elif args.subcommand == "status":
-        cmd_status(args)
-    else:
-        parser.print_help()
+            ProxyProfile.parse(argv[0])
+            return interactive_wizard(argv[0])
+        except (OSError, ValueError, EOFError):
+            print('Invalid proxy or incomplete interactive input.', file=sys.stderr)
+            return 1
+        except KeyboardInterrupt:
+            return 130
+    parser = SafeParser(description='DevProxy: process-scoped proxy sessions')
+    parser.add_argument('--version', action='version', version=__version__)
+    commands = parser.add_subparsers(dest='action')
+    profile = commands.add_parser('profile')
+    profiles = profile.add_subparsers(dest='profile_action', required=True)
+    add = profiles.add_parser('add')
+    add.add_argument('proxy', nargs='?')
+    add.add_argument('--name', '-n', default='default')
+    add.add_argument('--proxy-stdin', action='store_true')
+    add.set_defaults(handler=cmd_profile_add)
+    profiles.add_parser('list').set_defaults(handler=cmd_profile_list)
+    remove = profiles.add_parser('remove')
+    remove.add_argument('name')
+    remove.set_defaults(handler=cmd_profile_remove)
+    apps = commands.add_parser('apps')
+    apps.add_subparsers(required=True).add_parser('list').set_defaults(handler=cmd_apps_list)
+    for name, handler in [('test', cmd_test), ('run', cmd_run), ('exec', cmd_exec), ('serve', cmd_serve), ('apply', cmd_apply)]:
+        command = commands.add_parser(name)
+        command.set_defaults(handler=handler)
+        command.add_argument('--profile', '-p')
+        command.add_argument('--proxy')
+        command.add_argument('--proxy-stdin', action='store_true')
+        command.add_argument('--ca-file')
+        if name in ('run', 'exec', 'apply'):
+            command.add_argument('--dry-run', action='store_true')
+        if name in ('run', 'exec'):
+            command.add_argument('--no-proxy', help='Override inherited bypass list; empty means loopback only')
+        if name == 'run':
+            command.add_argument('app')
+            command.add_argument('--executable')
+            command.add_argument('--user-data-dir')
+            command.set_defaults(extra_args=[])
+        if name == 'exec':
+            command.set_defaults(command=[])
+        if name == 'serve':
+            command.add_argument('--port', type=int, default=0)
+        if name == 'test':
+            command.add_argument('--targets', help='Comma-separated host[:port] list')
+            command.add_argument('--echo', action='store_true')
+            command.add_argument('--json', action='store_true')
+        if name == 'apply':
+            command.add_argument('--app', '-a', required=True)
+            command.add_argument('--config-path')
+    restore = commands.add_parser('restore')
+    restore.add_argument('--app', '-a', required=True)
+    restore.add_argument('--dry-run', action='store_true')
+    restore.set_defaults(handler=cmd_restore)
+    commands.add_parser('status').set_defaults(handler=cmd_status)
+    commands.add_parser('doctor').set_defaults(handler=cmd_status)
+    detect = commands.add_parser('detect')
+    detect.add_argument('--save', action='store_true')
+    detect.set_defaults(handler=cmd_detect)
+    try:
+        if not argv:
+            return interactive_wizard()
+        rest = []
+        if '--' in argv:
+            split = argv.index('--')
+            argv, rest = argv[:split], argv[split + 1:]
+        args = parser.parse_args(argv)
+        if args.action == 'run':
+            args.extra_args = rest
+        elif args.action == 'exec':
+            args.command = rest
+        elif rest:
+            parser.error('Extra command arguments require run or exec.')
+        if not hasattr(args, 'handler'):
+            parser.print_help()
+            return 2
+        return args.handler(args) or 0
+    except KeyboardInterrupt:
+        print('Session stopped.', file=sys.stderr)
+        return 130
+    except EOFError:
+        print('Input ended.', file=sys.stderr)
+        return 1
+    except (OSError, ValueError, RuntimeError) as error:
+        print('Error:', redact_error(str(error)), file=sys.stderr)
+        return 1
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    raise SystemExit(main())

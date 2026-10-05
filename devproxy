@@ -1,18 +1,10 @@
 #!/usr/bin/env bash
-# ==============================================================================
-# DevProxy CLI v2.0.0 for Linux & macOS
-# Universal proxy manager for Antigravity, VS Code, Cursor, Windsurf, Codex, etc.
-# ==============================================================================
-
-set -e
-
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
-
-if command -v python3 >/dev/null 2>&1; then
-    exec python3 "$DIR/devproxy.py" "$@"
-elif command -v python >/dev/null 2>&1; then
-    exec python "$DIR/devproxy.py" "$@"
-else
-    echo "[-] Ошибка: Python 3 требуется для запуска devproxy." >&2
-    exit 1
-fi
+set -euo pipefail
+DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c 'import sys; sys.exit(sys.version_info < (3,11))'; then
+        exec "$candidate" "$DIR/devproxy.py" "$@"
+    fi
+done
+echo 'Python 3.11 or newer is required.' >&2
+exit 1
