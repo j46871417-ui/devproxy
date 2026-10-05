@@ -193,6 +193,7 @@ class Review(unittest.TestCase):
         upstream = Mock()
         upstream.recv.return_value = b'HTTP/1.1 200 OK\r\n\r\n'
         t = LocalTunnel(self.profile)
+        t.is_running = True  # Isolated handler fixture represents a live session.
         with patch('devproxy_pkg.core.tunnel.socket.create_connection', return_value=upstream) as connect, patch.object(t, '_pipe_duplex'):
             t._handle_client(client)
         connect.assert_called_once()
@@ -213,6 +214,7 @@ class Review(unittest.TestCase):
         upstream = Mock()
         upstream.recv.return_value = b'HTTP/1.1 407 Authentication Required\r\nX-Note: 200 cached\r\n\r\n'
         t = LocalTunnel(self.profile)
+        t.is_running = True
         with patch('devproxy_pkg.core.tunnel.socket.create_connection', return_value=upstream), patch.object(t, '_pipe_duplex'):
             t._handle_client(client)
         response = b''.join(call.args[0] for call in client.sendall.call_args_list)
@@ -224,6 +226,7 @@ class Review(unittest.TestCase):
         upstream = Mock()
         upstream.recv.side_effect = [b'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n', b'']
         t = LocalTunnel(ProxyProfile.parse('socks5://localhost:1080'))
+        t.is_running = True
         with patch('devproxy_pkg.core.tunnel.socket.create_connection', return_value=upstream), patch.object(t, '_socks5_connect_upstream', return_value=True), patch.object(t, '_pipe_duplex'):
             t._handle_client(client)
         forwarded = b''.join(call.args[0] for call in upstream.sendall.call_args_list)
@@ -236,6 +239,7 @@ class Review(unittest.TestCase):
         upstream = Mock()
         upstream.recv.return_value = b'HTTP/1.1 200 OK\r\n\r\n'
         t = LocalTunnel(self.profile)
+        t.is_running = True
         with patch('devproxy_pkg.core.tunnel.socket.create_connection', return_value=upstream) as connect, patch.object(t, '_pipe_duplex'):
             t._handle_client(client)
         connect.assert_called_once()

@@ -128,6 +128,36 @@ class Loopback(unittest.TestCase):
         self.assertNotIn(b'client-secret',captured[0])
         self.assertNotIn(b'pipelined-secret',captured[0])
 
+    def test_authenticated_socks_http_origin_receives_no_proxy_secret(self):
+        from devproxy_pkg.core.transport import read_headers, recv_exact
+        captured = []
+        def upstream(peer):
+            self.assertEqual(recv_exact(peer,3),b'\x05\x01\x02')
+            peer.sendall(b'\x05\x02')
+            version, size = recv_exact(peer,2)
+            self.assertEqual(version,1)
+            self.assertEqual(recv_exact(peer,size),b'dummy')
+            size = recv_exact(peer,1)[0]
+            self.assertEqual(recv_exact(peer,size),b'dummy-password')
+            peer.sendall(b'\x01\x00')
+            self.assertEqual(recv_exact(peer,4),b'\x05\x01\x00\x03')
+            size = recv_exact(peer,1)[0]
+            self.assertEqual(recv_exact(peer,size),b'example.test')
+            self.assertEqual(recv_exact(peer,2),b'\x00\x50')
+            peer.sendall(b'\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x50')
+            head, body = read_headers(peer)
+            captured.append(head+body)
+            peer.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
+        client = self.fixture(upstream,scheme='socks5h',credentials='dummy:dummy-password@')
+        client.sendall(b'GET http://example.test/path HTTP/1.1\r\nHost: example.test\r\nProxy-Authorization: Basic client-secret\r\n\r\n')
+        self.assertIn(b'200 OK',headers(client))
+        self.worker.join(2)
+        self.assertEqual(self.errors,[])
+        self.assertTrue(captured[0].startswith(b'GET /path HTTP/1.1'))
+        self.assertNotIn(b'Proxy-Authorization',captured[0])
+        self.assertNotIn(b'dummy-password',captured[0])
+        self.assertNotIn(b'client-secret',captured[0])
+
     def test_chunked_body_drops_proxy_authorization_trailer(self):
         from devproxy_pkg.core.transport import read_headers
         captured = []
