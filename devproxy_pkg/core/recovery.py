@@ -1,96 +1,182 @@
-"""
-Recovery: State management and atomic rollback for persistent changes.
-Tracks exact keys and values modified by devproxy in ~/.devproxy/state.json.
-When restoring, reverts ONLY keys modified by devproxy without wiping manual changes made later.
-"""
-
-import os
+"""Atomic profile store and conflict-aware recovery ledger."""
+from contextlib import contextmanager
 import json
+import os
 import tempfile
-from typing import Dict, Any, Optional
-from .config_editor import ConfigEditor
+import threading
+import time
+from .config_editor import ConfigEditor, parse_jsonc
+
+_LOCK = threading.RLock()
 
 
-def get_devproxy_state_path() -> str:
-    home = os.path.expanduser("~")
-    state_dir = os.path.join(home, ".devproxy")
-    os.makedirs(state_dir, exist_ok=True)
-    return os.path.join(state_dir, "state.json")
+def get_devproxy_state_path():
+    directory = os.environ.get("DEVPROXY_STATE_DIR") or os.path.join(os.path.expanduser("~"), ".devproxy")
+    os.makedirs(directory, exist_ok=True)
+    return os.path.join(directory, "state.json")
+
+
+@contextmanager
+def state_lock():
+    with _LOCK:
+        path = get_devproxy_state_path() + ".lock"
+        with open(path, "a+b") as file:
+            file.seek(0, os.SEEK_END)
+            if not file.tell():
+                file.write(b"0")
+                file.flush()
+            if os.name == "nt":
+                import msvcrt
+                deadline = time.monotonic() + 5
+                while True:
+                    file.seek(0)
+                    try:
+                        msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            raise OSError("Profile store is busy")
+                        time.sleep(0.05)
+                try:
+                    yield
+                finally:
+                    file.seek(0)
+                    msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(file, fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(file, fcntl.LOCK_UN)
 
 
 class StateManager:
+    @classmethod
+    def list_applications(cls):
+        records = cls.load_state().get("applications", [])
+        if not isinstance(records, list):
+            raise ValueError("Invalid saved application list")
+        return records
+
+    @classmethod
+    def save_applications(cls, records, discovery_completed=False, profile_name=None):
+        with state_lock():
+            state = cls.load_state()
+            state["applications"] = records
+            if profile_name:
+                state["selected_profile"] = profile_name
+            if discovery_completed:
+                state["discovery_completed"] = True
+            cls.save_state(state)
+
     @staticmethod
-    def load_state() -> dict:
+    def load_state():
         path = get_devproxy_state_path()
-        if not os.path.exists(path):
-            return {"profiles": {}, "applied": {}}
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
+            with open(path, encoding="utf-8") as file:
+                state = json.load(file)
+        except FileNotFoundError:
             return {"profiles": {}, "applied": {}}
+        except (ValueError, UnicodeError):
+            raise ValueError("Profile store is corrupt; refusing to overwrite it") from None
+        if not isinstance(state, dict) or any(not isinstance(state.get(k, {}), dict) for k in ("profiles", "applied")):
+            raise ValueError("Invalid profile store")
+        return state
 
     @staticmethod
-    def save_state(state: dict):
+    def save_state(state):
         path = get_devproxy_state_path()
-        dir_name = os.path.dirname(path)
-        os.makedirs(dir_name, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(dir=dir_name, prefix="state_")
+        fd, temporary = tempfile.mkstemp(dir=os.path.dirname(path), prefix="state_")
         try:
-            with open(fd, "w", encoding="utf-8") as f:
-                json.dump(state, f, indent=2, ensure_ascii=False)
-            os.replace(tmp_path, path)
-        except Exception:
-            if os.path.exists(tmp_path):
-                try: os.remove(tmp_path)
-                except Exception: pass
+            with os.fdopen(fd, "w", encoding="utf-8") as file:
+                json.dump(state, file, indent=2, ensure_ascii=False)
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.remove(temporary)
 
     @classmethod
-    def record_applied_change(cls, app_id: str, file_path: str, modified_keys: Dict[str, Any], original_values: Dict[str, Any]):
-        """Records modification made to a specific application file."""
-        state = cls.load_state()
-        applied = state.setdefault("applied", {})
-        app_record = applied.setdefault(app_id, {})
-        app_record[file_path] = {
-            "modified_keys": list(modified_keys.keys()),
-            "original_values": original_values
-        }
-        cls.save_state(state)
-
-    @classmethod
-    def get_applied_record(cls, app_id: str) -> Optional[dict]:
-        state = cls.load_state()
-        return state.get("applied", {}).get(app_id)
-
-    @classmethod
-    def clear_applied_record(cls, app_id: str):
-        state = cls.load_state()
-        if "applied" in state and app_id in state["applied"]:
-            del state["applied"][app_id]
+    def record_applied_change(cls, app_id, file_path, modified_keys, original_values):
+        with state_lock():
+            state = cls.load_state()
+            records = state.setdefault("applied", {}).setdefault(app_id, {})
+            old = records.get(file_path)
+            records[file_path] = {"modified_keys": list(modified_keys),
+                                 "applied_values": modified_keys,
+                                 "original_values": old["original_values"] if old else original_values}
             cls.save_state(state)
 
     @classmethod
-    def save_profile(cls, profile_dict: dict):
-        state = cls.load_state()
-        profiles = state.setdefault("profiles", {})
-        profiles[profile_dict["name"]] = profile_dict
-        cls.save_state(state)
+    def get_applied_record(cls, app_id):
+        return cls.load_state().get("applied", {}).get(app_id)
 
     @classmethod
-    def get_profile(cls, name: str) -> Optional[dict]:
-        state = cls.load_state()
-        return state.get("profiles", {}).get(name)
+    def clear_applied_record(cls, app_id):
+        with state_lock():
+            state = cls.load_state()
+            state.get("applied", {}).pop(app_id, None)
+            cls.save_state(state)
 
     @classmethod
-    def list_profiles(cls) -> Dict[str, dict]:
-        state = cls.load_state()
-        return state.get("profiles", {})
+    def save_profile(cls, profile_dict):
+        from .profile import ProxyProfile
+        ProxyProfile.from_dict(profile_dict)
+        with state_lock():
+            state = cls.load_state()
+            state.setdefault("profiles", {})[profile_dict["name"]] = profile_dict
+            cls.save_state(state)
 
     @classmethod
-    def delete_profile(cls, name: str) -> bool:
-        state = cls.load_state()
-        if "profiles" in state and name in state["profiles"]:
+    def get_profile(cls, name):
+        return cls.load_state().get("profiles", {}).get(name)
+
+    @classmethod
+    def list_profiles(cls):
+        return cls.load_state().get("profiles", {})
+
+    @classmethod
+    def delete_profile(cls, name):
+        with state_lock():
+            state = cls.load_state()
+            if name not in state.get("profiles", {}):
+                return False
             del state["profiles"][name]
             cls.save_state(state)
             return True
-        return False
+
+    @classmethod
+    def restore_app(cls, app_id):
+        with state_lock():
+            state = cls.load_state()
+            records = state.get("applied", {}).get(app_id, {})
+            if not records:
+                return False, "No changes recorded"
+            messages = []
+            for path, record in list(records.items()):
+                current, raw = ConfigEditor.load_jsonc(path)
+                expected = record.get("applied_values")
+                if current is None or not raw or expected is None:
+                    messages.append("Recovery needs a valid JSONC file and a verified ledger; record retained")
+                    continue
+                if any(current.get(k) != v for k, v in expected.items()):
+                    messages.append("Settings changed since apply; record retained")
+                    continue
+                updates = {}
+                remove = []
+                for key, value in record["original_values"].items():
+                    if value == {"$devproxy_missing": True}:
+                        remove.append(key)
+                    else:
+                        updates[key] = value
+                content = ConfigEditor.remove_json_fields_preserving(raw, remove)
+                content = ConfigEditor.update_json_fields_preserving(content, updates)
+                ConfigEditor.atomic_write(path, content)
+                del records[path]
+                messages.append("Settings restored")
+            if not records:
+                state.get("applied", {}).pop(app_id, None)
+            cls.save_state(state)
+            return not records, "; ".join(messages)

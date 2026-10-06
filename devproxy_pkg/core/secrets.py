@@ -1,281 +1,112 @@
-"""
-SecretStore: Secure, OS-native storage for proxy passwords.
-- Windows: Windows Credential Manager / DPAPI (CryptProtectData via ctypes).
-- macOS: Keychain via security tool.
-- Linux: Secret Service via secret-tool or DBus.
-- Fallback: Ephemeral in-memory storage (never saves unencrypted secrets to disk).
-"""
-
-import sys
-import os
+"""Credential Manager on Windows. Persistent saves never fall back silently."""
 import ctypes
-from typing import Optional
-
+import os
+import sys
+from ctypes import wintypes
 
 SERVICE_NAME = "devproxy-auth"
 
 
 class EphemeralStore:
-    """In-memory fallback for current process session only."""
     _cache = {}
 
     @classmethod
-    def set(cls, key: str, value: str):
+    def set(cls, key, value):
         cls._cache[key] = value
 
     @classmethod
-    def get(cls, key: str) -> Optional[str]:
+    def get(cls, key):
         return cls._cache.get(key)
 
     @classmethod
-    def delete(cls, key: str):
+    def delete(cls, key):
         cls._cache.pop(key, None)
 
 
 class WindowsCredentialStore:
-    """
-    Windows Credential Manager integration via Advapi32 CredWriteW / CredReadW / CredDeleteW.
-    Standard, robust and non-destructive.
-    """
-    CRED_TYPE_GENERIC = 1
-    CRED_PERSIST_LOCAL_MACHINE = 2
-
     class CREDENTIAL(ctypes.Structure):
-        _fields_ = [
-            ("Flags", ctypes.c_ulong),
-            ("Type", ctypes.c_ulong),
-            ("TargetName", ctypes.c_wchar_p),
-            ("Comment", ctypes.c_wchar_p),
-            ("LastWritten", ctypes.c_ulonglong),
-            ("CredentialBlobSize", ctypes.c_ulong),
-            ("CredentialBlob", ctypes.c_void_p),
-            ("Persist", ctypes.c_ulong),
-            ("AttributeCount", ctypes.c_ulong),
-            ("Attributes", ctypes.c_void_p),
-            ("TargetAlias", ctypes.c_wchar_p),
-            ("UserName", ctypes.c_wchar_p),
-        ]
+        _fields_ = [("Flags", wintypes.DWORD), ("Type", wintypes.DWORD),
+                    ("TargetName", wintypes.LPWSTR), ("Comment", wintypes.LPWSTR),
+                    ("LastWritten", wintypes.FILETIME), ("CredentialBlobSize", wintypes.DWORD),
+                    ("CredentialBlob", ctypes.c_void_p), ("Persist", wintypes.DWORD),
+                    ("AttributeCount", wintypes.DWORD), ("Attributes", ctypes.c_void_p),
+                    ("TargetAlias", wintypes.LPWSTR), ("UserName", wintypes.LPWSTR)]
 
     @classmethod
-    def is_available(cls) -> bool:
-        return sys.platform == "win32"
+    def _api(cls):
+        api = ctypes.WinDLL("advapi32", use_last_error=True)
+        api.CredWriteW.argtypes = [ctypes.POINTER(cls.CREDENTIAL), wintypes.DWORD]
+        api.CredWriteW.restype = wintypes.BOOL
+        api.CredReadW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                 ctypes.POINTER(ctypes.POINTER(cls.CREDENTIAL))]
+        api.CredReadW.restype = wintypes.BOOL
+        api.CredDeleteW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD]
+        api.CredDeleteW.restype = wintypes.BOOL
+        api.CredFree.argtypes = [ctypes.c_void_p]
+        api.CredFree.restype = None
+        return api
 
     @classmethod
-    def set_password(cls, profile_name: str, username: str, password: str) -> bool:
+    def is_available(cls):
+        return os.name == "nt"
+
+    @classmethod
+    def set_password(cls, profile_name, username, password):
         if not cls.is_available():
             return False
-        try:
-            advapi32 = ctypes.windll.advapi32
-            target_name = f"{SERVICE_NAME}:{profile_name}"
-            blob = password.encode("utf-16le")
-            
-            cred = cls.CREDENTIAL()
-            cred.Flags = 0
-            cred.Type = cls.CRED_TYPE_GENERIC
-            cred.TargetName = target_name
-            cred.Comment = "DevProxy secure credentials"
-            cred.CredentialBlobSize = len(blob)
-            cred.CredentialBlob = ctypes.cast(ctypes.c_char_p(blob), ctypes.c_void_p)
-            cred.Persist = cls.CRED_PERSIST_LOCAL_MACHINE
-            cred.AttributeCount = 0
-            cred.Attributes = None
-            cred.TargetAlias = None
-            cred.UserName = username or "proxy-user"
-
-            res = advapi32.CredWriteW(ctypes.byref(cred), 0)
-            return bool(res)
-        except Exception:
-            return False
+        blob = password.encode("utf-16le")
+        if len(blob) > 2560:
+            raise ValueError("Credential exceeds Windows storage limit")
+        buffer = ctypes.create_string_buffer(blob)
+        credential = cls.CREDENTIAL()
+        credential.Type = 1
+        credential.TargetName = f"{SERVICE_NAME}:{profile_name}"
+        credential.CredentialBlobSize = len(blob)
+        credential.CredentialBlob = ctypes.cast(buffer, ctypes.c_void_p)
+        credential.Persist = 2
+        credential.UserName = username or "proxy-user"
+        return bool(cls._api().CredWriteW(ctypes.byref(credential), 0))
 
     @classmethod
-    def get_password(cls, profile_name: str) -> Optional[str]:
+    def get_password(cls, profile_name):
         if not cls.is_available():
+            return None
+        api = cls._api()
+        pointer = ctypes.POINTER(cls.CREDENTIAL)()
+        if not api.CredReadW(f"{SERVICE_NAME}:{profile_name}", 1, 0, ctypes.byref(pointer)):
             return None
         try:
-            advapi32 = ctypes.windll.advapi32
-            target_name = f"{SERVICE_NAME}:{profile_name}"
-            p_cred = ctypes.POINTER(cls.CREDENTIAL)()
-            
-            res = advapi32.CredReadW(target_name, cls.CRED_TYPE_GENERIC, 0, ctypes.byref(p_cred))
-            if not res or not p_cred:
-                return None
-            
-            cred = p_cred.contents
-            blob_size = cred.CredentialBlobSize
-            blob_ptr = cred.CredentialBlob
-            
-            if blob_ptr and blob_size > 0:
-                raw_bytes = ctypes.string_at(blob_ptr, blob_size)
-                advapi32.CredFree(p_cred)
-                return raw_bytes.decode("utf-16le", errors="ignore")
-            
-            advapi32.CredFree(p_cred)
-            return None
-        except Exception:
-            return None
+            credential = pointer.contents
+            return ctypes.string_at(credential.CredentialBlob, credential.CredentialBlobSize).decode("utf-16le")
+        finally:
+            api.CredFree(pointer)
 
     @classmethod
-    def delete_password(cls, profile_name: str) -> bool:
+    def delete_password(cls, profile_name):
         if not cls.is_available():
             return False
-        try:
-            advapi32 = ctypes.windll.advapi32
-            target_name = f"{SERVICE_NAME}:{profile_name}"
-            res = advapi32.CredDeleteW(target_name, cls.CRED_TYPE_GENERIC, 0)
-            return bool(res)
-        except Exception:
-            return False
-
-
-class MacOSKeychainStore:
-    """macOS Keychain access using `/usr/bin/security`."""
-    @classmethod
-    def is_available(cls) -> bool:
-        return sys.platform == "darwin" and os.path.exists("/usr/bin/security")
-
-    @classmethod
-    def set_password(cls, profile_name: str, username: str, password: str) -> bool:
-        if not cls.is_available():
-            return False
-        import subprocess
-        target = f"{SERVICE_NAME}:{profile_name}"
-        # -U updates if existing
-        cmd = [
-            "/usr/bin/security", "add-generic-password",
-            "-U", "-s", target, "-a", username or "proxy-user",
-            "-w", password
-        ]
-        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return res.returncode == 0
-
-    @classmethod
-    def get_password(cls, profile_name: str) -> Optional[str]:
-        if not cls.is_available():
-            return None
-        import subprocess
-        target = f"{SERVICE_NAME}:{profile_name}"
-        cmd = ["/usr/bin/security", "find-generic-password", "-s", target, "-w"]
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-        if res.returncode == 0:
-            return res.stdout.strip()
-        return None
-
-    @classmethod
-    def delete_password(cls, profile_name: str) -> bool:
-        if not cls.is_available():
-            return False
-        import subprocess
-        target = f"{SERVICE_NAME}:{profile_name}"
-        cmd = ["/usr/bin/security", "delete-generic-password", "-s", target]
-        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return res.returncode == 0
-
-
-class LinuxSecretStore:
-    """Linux Secret Service via `secret-tool`."""
-    @classmethod
-    def is_available(cls) -> bool:
-        if sys.platform != "linux":
-            return False
-        import shutil
-        return shutil.which("secret-tool") is not None
-
-    @classmethod
-    def set_password(cls, profile_name: str, username: str, password: str) -> bool:
-        if not cls.is_available():
-            return False
-        import subprocess
-        cmd = [
-            "secret-tool", "store",
-            "--label", f"DevProxy {profile_name}",
-            "service", SERVICE_NAME,
-            "profile", profile_name
-        ]
-        p = subprocess.run(cmd, input=password.encode(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return p.returncode == 0
-
-    @classmethod
-    def get_password(cls, profile_name: str) -> Optional[str]:
-        if not cls.is_available():
-            return None
-        import subprocess
-        cmd = [
-            "secret-tool", "lookup",
-            "service", SERVICE_NAME,
-            "profile", profile_name
-        ]
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-        if res.returncode == 0:
-            val = res.stdout.strip()
-            return val if val else None
-        return None
-
-    @classmethod
-    def delete_password(cls, profile_name: str) -> bool:
-        if not cls.is_available():
-            return False
-        import subprocess
-        cmd = [
-            "secret-tool", "clear",
-            "service", SERVICE_NAME,
-            "profile", profile_name
-        ]
-        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return res.returncode == 0
+        return bool(cls._api().CredDeleteW(f"{SERVICE_NAME}:{profile_name}", 1, 0))
 
 
 class SecretStore:
-    """
-    Unified SecretStore facade for secure credential storage.
-    Delegates to platform native store, with safe ephemeral session memory fallback.
-    Never prints secrets or writes them unencrypted to files.
-    """
     @classmethod
-    def store_password(cls, profile_name: str, username: str, password: str) -> str:
-        """Stores password securely. Returns backend used: 'os_keychain' or 'session_memory'."""
-        if not password:
+    def store_password(cls, profile_name, username, password, require_persistent=False):
+        if password is None:
             return "none"
-
-        stored = False
-        if sys.platform == "win32":
-            stored = WindowsCredentialStore.set_password(profile_name, username, password)
-        elif sys.platform == "darwin":
-            stored = MacOSKeychainStore.set_password(profile_name, username, password)
-        elif sys.platform.startswith("linux"):
-            stored = LinuxSecretStore.set_password(profile_name, username, password)
-
-        if stored:
+        if WindowsCredentialStore.is_available() and WindowsCredentialStore.set_password(profile_name, username, password):
+            EphemeralStore.delete(profile_name)
             return "os_keychain"
-        
-        # Ephemeral in-memory fallback
+        if require_persistent:
+            raise OSError("Windows Credential Manager unavailable; profile was not saved")
         EphemeralStore.set(profile_name, password)
         return "session_memory"
 
     @classmethod
-    def get_password(cls, profile_name: str) -> Optional[str]:
-        """Retrieves password from OS vault or ephemeral memory."""
-        # 1. Ephemeral cache first (if set during this run)
-        mem_val = EphemeralStore.get(profile_name)
-        if mem_val:
-            return mem_val
-
-        # 2. OS Keychain
-        if sys.platform == "win32":
-            return WindowsCredentialStore.get_password(profile_name)
-        elif sys.platform == "darwin":
-            return MacOSKeychainStore.get_password(profile_name)
-        elif sys.platform.startswith("linux"):
-            return LinuxSecretStore.get_password(profile_name)
-        return None
+    def get_password(cls, profile_name):
+        memory = EphemeralStore.get(profile_name)
+        return memory if memory is not None else WindowsCredentialStore.get_password(profile_name)
 
     @classmethod
-    def delete_password(cls, profile_name: str) -> bool:
-        """Deletes password from OS vault and memory."""
+    def delete_password(cls, profile_name):
         EphemeralStore.delete(profile_name)
-        if sys.platform == "win32":
-            return WindowsCredentialStore.delete_password(profile_name)
-        elif sys.platform == "darwin":
-            return MacOSKeychainStore.delete_password(profile_name)
-        elif sys.platform.startswith("linux"):
-            return LinuxSecretStore.delete_password(profile_name)
-        return True
+        return WindowsCredentialStore.delete_password(profile_name)

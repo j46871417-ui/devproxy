@@ -1,176 +1,108 @@
-"""
-ProxyProfile: Data model and parsing logic for proxy configurations.
-Supports:
-- http://host:port, https://host:port
-- http://user:password@host:port, https://user:password@host:port
-- socks5://host:port, socks5://user:password@host:port
-- socks5h://host:port, socks5h://user:password@host:port
-- host:port
-- host:port:user:password (deterministic parsing)
-- IPv6 addresses in [::1] bracket format.
-"""
-
+"""Validated proxy metadata; secrets never serialize or appear in parse errors."""
+import ipaddress
 import urllib.parse
 from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from typing import Optional
 
 
 @dataclass
 class ProxyProfile:
     name: str
-    protocol: str  # 'http', 'https', 'socks5', 'socks5h'
+    protocol: str
     host: str
     port: int
     username: Optional[str] = None
     password: Optional[str] = field(default=None, repr=False)
-    dns_remote: bool = False  # True for socks5h, or when explicitly requested
+    dns_remote: bool = True
     notes: Optional[str] = None
+    secret_reference: Optional[str] = None
 
     def __post_init__(self):
         self.protocol = self.protocol.lower()
+        if self.protocol not in ("http", "https", "socks5", "socks5h"):
+            raise ValueError("Unsupported proxy protocol")
+        if isinstance(self.port, bool) or not isinstance(self.port, int) or not 1 <= self.port <= 65535:
+            raise ValueError("Proxy port must be an integer in 1..65535")
+        if not self.name or len(self.name) > 128 or any(ord(c) < 32 for c in self.name):
+            raise ValueError("Invalid profile name")
+        if not self.host or any(ord(c) <= 32 or ord(c) == 127 or c in "/\\@?#[]" for c in self.host):
+            raise ValueError("Invalid proxy hostname")
+        if ":" in self.host:
+            try:
+                ipaddress.IPv6Address(self.host)
+            except ValueError:
+                raise ValueError("Invalid IPv6 proxy address") from None
+        else:
+            try:
+                self.host.encode("idna")
+            except UnicodeError:
+                raise ValueError("Invalid proxy hostname") from None
+        if self.username and ":" in self.username and not self.is_socks:
+            raise ValueError("HTTP Basic username cannot contain a colon")
         if self.protocol == "socks5h":
             self.dns_remote = True
-        if not self.port or self.port < 1 or self.port > 65535:
-            raise ValueError(f"Invalid port: {self.port}. Must be 1-65535.")
-        if not self.host:
-            raise ValueError("Host cannot be empty.")
 
     @property
-    def is_socks(self) -> bool:
+    def is_socks(self):
         return self.protocol in ("socks5", "socks5h")
 
     @property
-    def has_auth(self) -> bool:
-        return bool(self.username or self.password)
+    def has_auth(self):
+        return self.username is not None or self.password is not None or self.secret_reference is not None
 
-    def to_url(self, include_auth: bool = True) -> str:
-        """Constructs canonical URL."""
-        proto = self.protocol
-        host_str = f"[{self.host}]" if ":" in self.host and not self.host.startswith("[") else self.host
+    def to_url(self, include_auth=False):
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        auth = ""
         if include_auth and self.has_auth:
-            user = urllib.parse.quote(self.username or "", safe="")
-            pwd = urllib.parse.quote(self.password or "", safe="")
-            return f"{proto}://{user}:{pwd}@{host_str}:{self.port}"
-        return f"{proto}://{host_str}:{self.port}"
+            raise ValueError("Credentials in proxy URLs are prohibited")
+        return f"{self.protocol}://{auth}{host}:{self.port}"
 
-    def to_safe_url(self) -> str:
-        """Returns URL with masked password for display/logging."""
-        if not self.has_auth:
-            return self.to_url(include_auth=False)
-        proto = self.protocol
-        host_str = f"[{self.host}]" if ":" in self.host and not self.host.startswith("[") else self.host
-        user = urllib.parse.quote(self.username or "", safe="")
-        return f"{proto}://{user}:***@{host_str}:{self.port}"
+    def to_safe_url(self):
+        return self.to_url()
 
-    def to_dict(self, include_password: bool = False) -> dict:
-        d = {
-            "name": self.name,
-            "protocol": self.protocol,
-            "host": self.host,
-            "port": self.port,
-            "username": self.username,
-            "dns_remote": self.dns_remote,
-            "notes": self.notes
-        }
-        if include_password and self.password:
-            d["password"] = self.password
-        return d
+    def to_dict(self, include_password=False):
+        if include_password:
+            raise ValueError("Secret serialization is prohibited")
+        return dict(name=self.name, protocol=self.protocol, host=self.host, port=self.port,
+                    username=self.username, dns_remote=self.dns_remote, notes=self.notes,
+                    secret_reference=self.secret_reference)
 
     @classmethod
-    def from_dict(cls, data: dict, password: Optional[str] = None) -> "ProxyProfile":
-        return cls(
-            name=data["name"],
-            protocol=data.get("protocol", "http"),
-            host=data["host"],
-            port=int(data["port"]),
-            username=data.get("username"),
-            password=password or data.get("password"),
-            dns_remote=bool(data.get("dns_remote", False)),
-            notes=data.get("notes")
-        )
+    def from_dict(cls, data, password=None):
+        if "password" in data:
+            raise ValueError("Plaintext credentials in configuration; migrate to the credential store")
+        return cls(name=data["name"], protocol=data.get("protocol", "http"), host=data["host"],
+                   port=data["port"], username=data.get("username"), password=password,
+                   dns_remote=data.get("dns_remote", True), notes=data.get("notes"),
+                   secret_reference=data.get("secret_reference"))
 
     @classmethod
-    def parse(cls, raw: str, name: str = "default", fallback_protocol: str = "http") -> "ProxyProfile":
-        """
-        Parses proxy string into a ProxyProfile.
-        Handles:
-        1. Full URL formats (http://, https://, socks5://, socks5h://)
-        2. host:port
-        3. host:port:user:password
-        4. IPv6 addresses [::1]:port
-        """
-        raw = raw.strip().strip("'\"")
-        if not raw:
-            raise ValueError("Proxy string cannot be empty.")
-
-        # 1. Scheme check
-        if "://" in raw:
-            parsed = urllib.parse.urlsplit(raw)
-            scheme = parsed.scheme.lower()
-            if scheme not in ("http", "https", "socks5", "socks5h"):
-                raise ValueError(f"Unsupported proxy scheme: '{scheme}'. Use http, https, socks5, or socks5h.")
-            
-            host = parsed.hostname
-            port = parsed.port
-            if not host:
-                raise ValueError(f"Invalid host in proxy URL: '{raw}'")
-            if not port:
-                # Default ports
-                port = 443 if scheme == "https" else 1080 if "socks" in scheme else 8080
-
-            username = urllib.parse.unquote(parsed.username) if parsed.username is not None else None
-            password = urllib.parse.unquote(parsed.password) if parsed.password is not None else None
-
-            dns_remote = (scheme == "socks5h")
-            return cls(
-                name=name,
-                protocol=scheme,
-                host=host,
-                port=port,
-                username=username,
-                password=password,
-                dns_remote=dns_remote
-            )
-
-        # 2. Bracketed IPv6 without scheme: e.g. [::1]:8080 or [::1]:8080:user:pass
-        if raw.startswith("["):
-            end_bracket = raw.find("]")
-            if end_bracket != -1:
-                host = raw[1:end_bracket]
-                remainder = raw[end_bracket+1:]
-                if remainder.startswith(":"):
-                    parts = remainder[1:].split(":")
-                    if len(parts) == 1:
-                        port = int(parts[0])
-                        return cls(name=name, protocol=fallback_protocol, host=host, port=port)
-                    elif len(parts) == 3:
-                        port = int(parts[0])
-                        user, pwd = parts[1], parts[2]
-                        return cls(name=name, protocol=fallback_protocol, host=host, port=port, username=user, password=pwd)
-
-        # 3. Formats with colons: host:port:user:pass or host:port
-        parts = raw.split(":")
-        if len(parts) == 4:
-            # host:port:user:pass
-            host, port_str, user, pwd = parts
-            try:
-                port = int(port_str)
-                return cls(name=name, protocol=fallback_protocol, host=host, port=port, username=user, password=pwd)
-            except ValueError:
-                raise ValueError(f"Invalid port in 'host:port:user:pass': '{port_str}'")
-
-        if len(parts) == 2:
-            # host:port
-            host, port_str = parts
-            try:
-                port = int(port_str)
-                return cls(name=name, protocol=fallback_protocol, host=host, port=port)
-            except ValueError:
-                raise ValueError(f"Invalid port in 'host:port': '{port_str}'")
-
-        # If it doesn't match standard patterns
-        raise ValueError(
-            f"Cannot deterministically parse proxy string '{raw}'. "
-            "Please use full URL (e.g. 'http://user:pass@host:port' or 'socks5://host:port') "
-            "or 'host:port'."
-        )
+    def parse(cls, raw, name="default", fallback_protocol="http"):
+        try:
+            raw = raw.strip().strip("'\"")
+            if not raw or any(ord(c) < 32 for c in raw):
+                raise ValueError()
+            if "://" not in raw:
+                if raw.startswith("["):
+                    closing = raw.index("]")
+                    host = raw[1:closing]
+                    parts = raw[closing + 1:].removeprefix(":").split(":", 2)
+                else:
+                    host, rest = raw.split(":", 1)
+                    parts = rest.split(":", 2)
+                if len(parts) not in (1, 3):
+                    raise ValueError()
+                return cls(name, fallback_protocol, host, int(parts[0]),
+                           parts[1] if len(parts) == 3 else None,
+                           parts[2] if len(parts) == 3 else None)
+            url = urllib.parse.urlsplit(raw)
+            if url.path not in ("", "/") or url.query or url.fragment:
+                raise ValueError()
+            port = url.port
+            if port is None:
+                port = 443 if url.scheme == "https" else 1080 if url.scheme in ("socks5", "socks5h") else 8080
+            return cls(name, url.scheme, url.hostname, port,
+                       urllib.parse.unquote(url.username) if url.username is not None else None,
+                       urllib.parse.unquote(url.password) if url.password is not None else None)
+        except (ValueError, TypeError, AttributeError, UnicodeError):
+            raise ValueError("Invalid proxy address; use scheme://host:port (IPv6 in brackets)") from None

@@ -11,3 +11,16 @@ __pycache__/
 # OS
 Thumbs.db
 .DS_Store
+.venv/
+build/
+dist/
+*.spec
+.devproxy-test-state/
+build-validation.log
+followup-tests.log
+
+# Local release output and private handoff material
+/dist-next/
+/*.log
+/GEMINI_PROMPT.md
+/ORIGINAL_REQUIREMENTS.md

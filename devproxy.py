@@ -16,4 +16,4 @@ if script_dir not in sys.path:
 from devproxy_pkg.cli import main
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

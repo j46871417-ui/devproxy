@@ -8,6 +8,7 @@ from .antigravity import AntigravityAdapter
 from .vscode_family import VSCodeAdapter, CursorAdapter, WindsurfAdapter, VSCodiumAdapter
 from .opencode import OpenCodeAdapter
 from .codex import CodexCliAdapter, CodexGuiAdapter
+from .catalog import extra_adapters
 
 
 ALL_ADAPTERS: List[ApplicationAdapter] = [
@@ -20,6 +21,7 @@ ALL_ADAPTERS: List[ApplicationAdapter] = [
     CodexCliAdapter(),
     CodexGuiAdapter(),
 ]
+ALL_ADAPTERS.extend(extra_adapters())
 
 
 def get_adapter(app_id: str) -> Optional[ApplicationAdapter]:

@@ -17,7 +17,7 @@ class TestProxyProfile(unittest.TestCase):
         self.assertEqual(p.username, "user")
         self.assertEqual(p.password, "pass123")
         self.assertTrue(p.is_socks)
-        self.assertEqual(p.to_safe_url(), "socks5://user:***@myproxy.net:1080")
+        self.assertEqual(p.to_safe_url(), "socks5://myproxy.net:1080")
 
     def test_parse_socks5h(self):
         p = ProxyProfile.parse("socks5h://remote.host:10808")
@@ -36,7 +36,7 @@ class TestProxyProfile(unittest.TestCase):
         self.assertEqual(p.port, 3128)
         self.assertEqual(p.username, "alice")
         self.assertEqual(p.password, "secretP@ss")
-        self.assertEqual(p.to_safe_url(), "http://alice:***@proxy.co:3128")
+        self.assertEqual(p.to_safe_url(), "http://proxy.co:3128")
 
     def test_ipv6_bracketed(self):
         p = ProxyProfile.parse("http://[2001:db8::1]:8080")

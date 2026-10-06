@@ -1,158 +1,171 @@
-"""
-ConfigEditor: Safe JSONC and config modifier.
-- Preserves comments and structure where possible.
-- Atomic writes with backups.
-- Keeps track of changes made specifically by devproxy in a rollback ledger.
-- Never replaces a malformed file with an empty dictionary.
-"""
-
-import os
+"""Token-based top-level JSONC edits with validation and atomic replacement."""
 import json
+import os
 import re
 import shutil
 import tempfile
-from typing import Any, Dict, Optional, Tuple
 
 
-def strip_json_comments(text: str) -> str:
-    """State-machine comment stripper preserving string literals and URLs."""
-    out = []
-    in_string = False
-    escape = False
-    i = 0
-    n = len(text)
-    while i < n:
-        c = text[i]
-        if in_string:
-            out.append(c)
-            if escape:
-                escape = False
-            elif c == '\\':
-                escape = True
-            elif c == '"':
-                in_string = False
+_TOKEN = re.compile(r'\s+|//[^\r\n]*|/\*[\s\S]*?\*/|"(?:\\.|[^"\\])*"|[{}\[\]:,]|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null')
+
+
+def tokens(text):
+    result = []
+    pos = 1 if text.startswith("\ufeff") else 0
+    while pos < len(text):
+        match = _TOKEN.match(text, pos)
+        if not match:
+            raise ValueError("Invalid JSONC token")
+        value = match.group()
+        if not value.isspace() and not value.startswith(("//", "/*")):
+            result.append((value, pos, match.end()))
+        pos = match.end()
+    return result
+
+
+def strip_json_comments(text):
+    output = list(text)
+    pos = 1 if text.startswith("\ufeff") else 0
+    if pos:
+        output[0] = " "
+    while pos < len(text):
+        match = _TOKEN.match(text, pos)
+        if not match:
+            raise ValueError("Invalid JSONC token")
+        if match.group().startswith(("//", "/*")):
+            for i in range(pos, match.end()):
+                if output[i] not in "\r\n":
+                    output[i] = " "
+        pos = match.end()
+    return "".join(output)
+
+
+def _unique(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def parse_jsonc(text):
+    clean = list(strip_json_comments(text))
+    ts = tokens(text)
+    for index, (value, start, end) in enumerate(ts[:-1]):
+        if value == "," and ts[index + 1][0] in ("}", "]"):
+            clean[start:end] = " " * (end - start)
+    data = json.loads("".join(clean), object_pairs_hook=_unique)
+    if not isinstance(data, dict):
+        raise ValueError("Settings must be an object")
+    return data
+
+
+def _fields(text):
+    parse_jsonc(text)
+    ts = tokens(text)
+    result = {}
+    i = 1
+    while ts[i][0] != "}":
+        key, key_start, _ = ts[i]
+        name = json.loads(key)
+        i += 2  # key and colon
+        start = ts[i][1]
+        if ts[i][0] in ("{", "["):
+            depth = 0
+            while True:
+                value = ts[i][0]
+                depth += value in ("{", "[")
+                depth -= value in ("}", "]")
+                end = ts[i][2]
+                i += 1
+                if not depth:
+                    break
+        else:
+            end = ts[i][2]
             i += 1
-            continue
-
-        if c == '"':
-            in_string = True
-            out.append(c)
+        comma = ts[i] if ts[i][0] == "," else None
+        result[name] = (key_start, start, end, comma)
+        if comma:
             i += 1
-            continue
+    return result, ts[i][1]
 
-        if c == '/' and i + 1 < n:
-            if text[i + 1] == '/':
-                # Line comment
-                while i < n and text[i] != '\n':
-                    i += 1
-                if i < n:
-                    out.append(text[i])
-                    i += 1
-                continue
-            elif text[i + 1] == '*':
-                # Block comment
-                i += 2
-                while i + 1 < n and not (text[i] == '*' and text[i + 1] == '/'):
-                    i += 1
-                i += 2
-                continue
 
-        out.append(c)
-        i += 1
-    return "".join(out)
+def _apply(text, edits):
+    for start, end, value in sorted(edits, reverse=True):
+        text = text[:start] + value + text[end:]
+    parse_jsonc(text)
+    return text
 
 
 class ConfigEditor:
     @staticmethod
-    def load_jsonc(path: str) -> Tuple[Optional[dict], Optional[str]]:
-        """
-        Safely reads JSONC file.
-        Returns: (parsed_dict, raw_text).
-        If file doesn't exist, returns ({}, "").
-        If parse error, returns (None, raw_text).
-        """
-        if not os.path.exists(path):
-            return {}, ""
+    def load_jsonc(path):
+        raw = None
         try:
-            with open(path, "r", encoding="utf-8-sig") as f:
+            with open(path, "r", encoding="utf-8", newline="") as f:
                 raw = f.read()
-            if not raw.strip():
-                return {}, ""
-            cleaned = strip_json_comments(raw)
-            # Remove trailing commas
-            cleaned = re.sub(r',\s*([\}\]])', r'\1', cleaned)
-            data = json.loads(cleaned)
-            return data, raw
-        except Exception as e:
+            return parse_jsonc(raw), raw
+        except FileNotFoundError:
+            return {}, ""
+        except (OSError, ValueError, UnicodeError):
             return None, raw
 
     @staticmethod
-    def update_json_fields_preserving(raw_text: str, updates: Dict[str, Any]) -> str:
-        """
-        Updates keys in JSON/JSONC text preserving other keys and comments.
-        If key exists, replaces its value using regex.
-        If key doesn't exist, inserts it before the final closing brace.
-        """
-        content = raw_text.strip()
-        if not content:
+    def update_json_fields_preserving(raw_text, updates):
+        if not raw_text:
             return json.dumps(updates, indent=4, ensure_ascii=False)
-
-        for key, val in updates.items():
-            val_json = json.dumps(val, ensure_ascii=False)
-            pattern = re.compile(
-                r'("' + re.escape(key) + r'"\s*:\s*)(?:"(?:\\.|[^"\\])*"|true|false|null|\d+(?:\.\d+)?|\[[^\]]*\]|\{[^\}]*\})'
-            )
-            if pattern.search(content):
-                content = pattern.sub(r'\g<1>' + val_json.replace('\\', r'\\'), content, count=1)
+        content = raw_text
+        for key, value in updates.items():
+            fields, closing = _fields(content)
+            encoded = json.dumps(value, ensure_ascii=False)
+            if key in fields:
+                _, start, end, _ = fields[key]
+                content = _apply(content, [(start, end, encoded)])
             else:
-                last_brace = content.rfind('}')
-                if last_brace != -1:
-                    before = content[:last_brace].rstrip()
-                    needs_comma = bool(before and not before.endswith('{') and not before.endswith(','))
-                    indent = "    "
-                    insert = (",\n" if needs_comma else "\n") + f'{indent}"{key}": {val_json}\n'
-                    content = before + insert + content[last_brace:]
-                else:
-                    content = json.dumps(updates, indent=4, ensure_ascii=False)
+                edits = [(closing, closing, "\n    " + json.dumps(key) + ": " + encoded + "\n")]
+                if fields:
+                    _, _, end, comma = next(reversed(fields.values()))
+                    if not comma:
+                        edits.append((end, end, ","))
+                content = _apply(content, edits)
         return content
 
     @staticmethod
-    def remove_json_fields_preserving(raw_text: str, keys: list) -> str:
-        """Removes specified keys from JSON/JSONC text preserving other structure."""
+    def remove_json_fields_preserving(raw_text, keys):
         content = raw_text
         for key in keys:
-            pattern = re.compile(
-                r'([ \t]*)"' + re.escape(key) + r'"\s*:\s*(?:"(?:\\.|[^"\\])*"|true|false|null|\d+(?:\.\d+)?|\[[^\]]*\]|\{[^\}]*\})\s*,?'
-            )
-            content = pattern.sub('', content)
-
-        # Cleanup dangling comma before closing brace
-        content = re.sub(r',\s*(\})', r'\1', content)
+            fields, _ = _fields(content)
+            if key not in fields:
+                continue
+            key_start, _, end, comma = fields[key]
+            edits = [(key_start, end, "")]
+            if comma:
+                edits.append((comma[1], comma[2], ""))
+            else:
+                names = list(fields)
+                index = names.index(key)
+                if index:
+                    previous = fields[names[index - 1]][3]
+                    if previous:
+                        edits.append((previous[1], previous[2], ""))
+            content = _apply(content, edits)
         return content
 
     @staticmethod
-    def atomic_write(path: str, content: str):
-        """Writes content atomically to avoid corruption on crash."""
-        dir_name = os.path.dirname(os.path.abspath(path))
-        os.makedirs(dir_name, exist_ok=True)
-        # Create backup if file exists
+    def atomic_write(path, content):
+        directory = os.path.dirname(os.path.abspath(path))
+        os.makedirs(directory, exist_ok=True)
         if os.path.exists(path):
-            backup_path = path + ".bak"
-            try:
-                shutil.copy2(path, backup_path)
-            except Exception:
-                pass
-
-        fd, tmp_path = tempfile.mkstemp(dir=dir_name, prefix="devproxy_tmp_")
+            # Backup failure must abort the edit.
+            shutil.copy2(path, path + ".bak")
+        fd, temporary = tempfile.mkstemp(dir=directory, prefix="devproxy_")
         try:
-            with open(fd, "w", encoding="utf-8") as f:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
                 f.write(content)
-            # Atomic replace
-            os.replace(tmp_path, path)
-        except Exception:
-            if os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
-            raise
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.remove(temporary)

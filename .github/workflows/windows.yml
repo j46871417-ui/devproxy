@@ -1,0 +1,53 @@
+name: Windows validation and release
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+      - run: python -m pip install -r requirements-build.txt
+      - run: python tools/build_windows.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: devproxy-windows-x64
+          path: |
+            dist/devproxy.exe
+            dist/devproxy-gui.exe
+            dist/devproxy-windows-x64.zip
+            dist/SHA256SUMS.txt
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: windows
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tag matches package version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python -c "import os; from devproxy_pkg import __version__; assert os.environ['RELEASE_TAG'] == 'v' + __version__"
+      - uses: actions/download-artifact@v4
+        with:
+          name: devproxy-windows-x64
+          path: dist
+      - name: Publish validated Windows release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release create "$env:RELEASE_TAG" --verify-tag --title "DevProxy $env:RELEASE_TAG" --notes-file CHANGELOG.md dist/devproxy.exe dist/devproxy-gui.exe dist/devproxy-windows-x64.zip dist/SHA256SUMS.txt

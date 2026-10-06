@@ -1,63 +1,81 @@
-"""
-ApplicationAdapter: Base abstract class for IDE and tool integrations.
-Each adapter provides:
-- app_id: Unique string identifier
-- display_name: Human-friendly name
-- detect(): Finds installed executables and config paths
-- get_cli_launch_flags(): Recommended process arguments (e.g. --proxy-server=...)
-- apply_persistent(): Safely applies proxy to config files
-- restore_persistent(): Rolls back changes made specifically by devproxy
-- limitations(): Known restrictions (e.g. extension host quirks, UDP/QUIC)
-"""
-
-from abc import ABC, abstractmethod
-from typing import Dict, Any, List, Optional, Tuple
-from ..core.profile import ProxyProfile
+"""Application identity and launch capabilities, independent of routing transport."""
+import os
+import shutil
+import sys
+from ..core.recovery import StateManager
 
 
-class ApplicationAdapter(ABC):
-    @property
-    @abstractmethod
-    def app_id(self) -> str:
-        pass
+class ApplicationAdapter:
+    supports_native_proxy_configuration = False
+    supports_environment_proxy = True
+    supports_routing_redirect = False
+    electron = False
+    discover_on_path = True
+
+    def __init__(self, app_id, display_name, names=(), folders=(), electron=False, config_folder=None):
+        self.app_id, self.display_name = app_id, display_name
+        self.names, self.folders = list(names), list(folders)
+        self.electron = electron
+        self.supports_native_proxy_configuration = electron
+        self.config_folder = config_folder
 
     @property
-    @abstractmethod
-    def display_name(self) -> str:
-        pass
+    def supported_os(self):
+        return ["win32"]
 
-    @property
-    @abstractmethod
-    def supported_os(self) -> List[str]:
-        """List of 'win32', 'darwin', 'linux'"""
-        pass
+    def get_executable_paths(self):
+        candidates = []
+        if sys.platform == "win32":
+            roots = [os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs"),
+                     os.environ.get("LOCALAPPDATA", ""),
+                     os.environ.get("ProgramFiles", r"C:\Program Files"),
+                     os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")]
+            for root in filter(None, roots):
+                for folder in self.folders:
+                    for name in self.names:
+                        candidates.append(os.path.join(root, folder, name if name.lower().endswith(".exe") else name + ".exe"))
+        for name in self.names:
+            if not self.discover_on_path:
+                continue
+            path = shutil.which(name)
+            if path and (sys.platform != "win32" or path.lower().endswith(".exe")):
+                candidates.append(path)
+            # Electron PATH often points to bin/code.cmd. Resolve the actual EXE.
+            wrapper = shutil.which(name + ".cmd") if sys.platform == "win32" else None
+            if wrapper:
+                root = os.path.dirname(os.path.dirname(wrapper))
+                candidates.extend(os.path.join(root, n if n.lower().endswith(".exe") else n + ".exe") for n in self.names)
+        result = []
+        for path in candidates:
+            if os.path.isfile(path):
+                absolute = os.path.realpath(path)
+                if absolute not in result:
+                    result.append(absolute)
+        return result
 
-    @abstractmethod
-    def detect_executable(self) -> Optional[str]:
-        """Returns path to binary if installed, else None."""
-        pass
+    def detect_executable(self):
+        paths = self.get_executable_paths()
+        return paths[0] if paths else None
 
-    @abstractmethod
-    def detect_config_files(self) -> List[str]:
-        """Returns list of existing or expected config file paths."""
-        pass
+    def matches_executable(self, executable):
+        identity = os.path.normcase(os.path.realpath(executable))
+        return any(identity == os.path.normcase(os.path.realpath(p)) for p in self.get_executable_paths())
 
-    @abstractmethod
-    def get_cli_launch_flags(self, profile: ProxyProfile) -> List[str]:
-        """Returns CLI flags for process launching, e.g. ['--proxy-server={PROXY_URL}']"""
-        pass
+    def detect_config_files(self):
+        if not self.config_folder:
+            return []
+        return [os.path.join(os.environ.get("APPDATA", ""), self.config_folder, "User", "settings.json")]
 
-    @abstractmethod
-    def apply_persistent(self, profile: ProxyProfile) -> Tuple[bool, str]:
-        """Applies persistent configuration with rollback recording."""
-        pass
+    def get_cli_launch_flags(self, profile):
+        return ["--proxy-server={PROXY_URL}"] if self.electron else []
 
-    @abstractmethod
-    def restore_persistent(self) -> Tuple[bool, str]:
-        """Rolls back changes made by devproxy."""
-        pass
+    def apply_persistent(self, profile):
+        return False, "Persistent config patching is disabled. Use an owned application session; credentials stay in DevProxy."
 
-    @abstractmethod
-    def get_limitations(self) -> List[str]:
-        """Returns verified limitations and requirements."""
-        pass
+    def restore_persistent(self):
+        return StateManager.restore_app(self.app_id)
+
+    def get_limitations(self):
+        return ["Native/environment proxy configuration is advisory.",
+                "Arbitrary child executables, DNS, UDP and applications ignoring proxy settings can bypass it.",
+                "Strict per-application routing requires a WFP backend, unavailable in this build."]

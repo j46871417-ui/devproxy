@@ -1,4 +1,5 @@
 import unittest
+import uuid
 from devproxy_pkg.core.secrets import SecretStore, EphemeralStore
 
 
@@ -10,11 +11,13 @@ class TestSecretStore(unittest.TestCase):
         self.assertIsNone(EphemeralStore.get("test-prof"))
 
     def test_secret_store_facade(self):
-        backend = SecretStore.store_password("unit-test-prof", "user1", "super-secret")
+        name = "test-" + uuid.uuid4().hex
+        self.addCleanup(SecretStore.delete_password, name)
+        backend = SecretStore.store_password(name, "user1", "super-secret")
         self.assertIn(backend, ["os_keychain", "session_memory"])
-        val = SecretStore.get_password("unit-test-prof")
+        val = SecretStore.get_password(name)
         self.assertEqual(val, "super-secret")
-        SecretStore.delete_password("unit-test-prof")
+        SecretStore.delete_password(name)
 
 
 if __name__ == "__main__":
