@@ -25,7 +25,7 @@ class IsolatedTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.directory = Path(self.temporary.name)
+        self.directory = Path(self.temporary.name).resolve()
         patch = mock.patch.dict(os.environ, DEVPROXY_STATE_DIR=str(self.directory))
         patch.start()
         self.addCleanup(patch.stop)
