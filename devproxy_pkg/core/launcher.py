@@ -18,9 +18,11 @@ class ApplicationSession:
     backend = "native-environment"
     guarantees_per_app_routing = False
 
-    def __init__(self, profile, bind_port=0):
+    def __init__(self, profile, bind_port=0, profile_provider=None):
         self.profile = profile
-        self.tunnel = LocalTunnel(profile, bind_port=bind_port)
+        # The provider supplies current saved metadata and secret for each NEW
+        # connection; existing streams keep the profile they opened with.
+        self.tunnel = LocalTunnel(profile, bind_port=bind_port, profile_provider=profile_provider)
         self.processes = []
         self._directories = []
         self._job = None

@@ -368,15 +368,20 @@ class RussianUiTests(IsolatedTests):
                                arguments=["-c", code, str(output)], electron=False, selected=True)]
         window.profile.set("fixture")
         window.target.set("github.com")
+        # The session resolves the *saved* profile through a provider, not through
+        # ui.resolve_profile. Store a real profile under that name so the provider
+        # reads genuine metadata, and install the live proxy as its credential
+        # source. The upstream ACL below still decides what is allowed, so the
+        # permitted request is what actually passes.
         with AllowlistProxy() as proxy:
+            StateManager.save_profile(proxy.profile(authenticated=False).to_dict())
             # The default diagnostic really is forbidden by the upstream ACL.
             with self.assertRaises(ProxyError) as rejected:
                 check_proxy(proxy.profile(authenticated=False), "github.com")
             self.assertEqual(rejected.exception.status, 403)
             proxy.requests.clear()
-            with mock.patch("devproxy_pkg.ui.resolve_profile", return_value=proxy.profile(authenticated=False)):
-                window.start()
-                window.worker.join(10)
+            window.start()
+            window.worker.join(10)
             self.assertFalse(window.worker.is_alive())
             events = []
             while not window.events.empty():

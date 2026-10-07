@@ -4,13 +4,15 @@ import getpass
 import logging
 import os
 import sys
+import uuid
 from .adapters import get_adapter, list_adapters
 from .adapters.generic import GenericApplicationAdapter
 from .core.profile import ProxyProfile
 from .core.secrets import SecretStore
-from .core.recovery import StateManager
+from .core.recovery import StateManager, state_lock
 from .core.launcher import ApplicationSession
 from .core.validator import ProxyValidator
+from . import __version__
 
 
 def resolve_profile(profile_name=None, proxy_str=None):
@@ -38,12 +40,141 @@ def save_profile(profile):
     persist_profile(profile)
 
 
+def resolve_saved_profile(name):
+    """Read metadata and its secret as one atomic snapshot for a new connection.
+
+    Metadata and credential are read under the same state lock, so a concurrent
+    save can never yield a new host/port paired with a stale password. A missing
+    profile or a removed secret raises; it never silently degrades to a
+    credential-free or direct connection.
+    """
+    with state_lock():
+        return resolve_profile(name)
+
+
+class SavedProfileProvider:
+    """A stable identity survives rename; deletion cannot reuse stale secrets."""
+    def __init__(self, name):
+        import threading
+        self._route_lock = threading.RLock()
+        self._retry_at = {}
+        self._failures = {}
+        self._pinned = False
+        self._selected_name = name
+        with state_lock():
+            state = StateManager.load_state()
+            data = state.get("profiles", {}).get(name)
+            if data is None:
+                raise ValueError("Proxy profile not found")
+            if not data.get("profile_id"):
+                data["profile_id"] = uuid.uuid4().hex
+                StateManager.save_state(state)
+            self.profile_id = data["profile_id"]
+            self._selected_id = self.profile_id
+
+    def __call__(self):
+        with self._route_lock:
+            return self._resolve(self._selected_id)
+
+    def _resolve(self, identity):
+        with state_lock():
+            profiles = StateManager.load_state().get("profiles", {})
+            names = [name for name, data in profiles.items()
+                     if data.get("profile_id") == identity]
+            if len(names) != 1:
+                raise ValueError("Proxy profile not found")
+            profile = resolve_profile(names[0])
+            if identity == self._selected_id:
+                self._selected_name = profile.name
+            return profile
+
+    def pin(self):
+        """Keep OAuth and the IDE on the same exit until this session closes."""
+        with self._route_lock:
+            self._pinned = True
+
+    def route_status(self):
+        # Status never waits for a network handshake or accesses the keychain.
+        return {"selected": self._selected_name, "pinned": self._pinned}
+
+    def open_connection(self, host, port, timeout, on_socket, forward_http=False):
+        from .core.transport import open_proxy, connect_upstream
+        with self._route_lock:
+            with state_lock():
+                backups = StateManager.load_state().get("route_groups", {}).get(self.profile_id, [])
+            parallel = self._pinned or not backups
+            profile = self._resolve(self._selected_id) if parallel else None
+        if parallel:
+            # A fixed exit needs no network-wide mutex: independent streams
+            # negotiate in parallel, including the browser and language server.
+            if forward_http:
+                return open_proxy(profile, timeout, on_socket), b"", profile
+            sock, tail = connect_upstream(profile, host, port, timeout, on_socket)
+            return sock, tail, profile
+        return self._open_routed(host, port, timeout, on_socket, forward_http)
+
+    def _open_routed(self, host, port, timeout, on_socket, forward_http=False):
+        import ssl
+        import time
+        from .core.transport import open_proxy, connect_upstream, ProxyError
+        with self._route_lock:
+            with state_lock():
+                state = StateManager.load_state()
+                backups = state.get("route_groups", {}).get(self.profile_id, [])
+            candidates = [self._selected_id]
+            if not self._pinned:
+                candidates += [identity for identity in [self.profile_id] + backups if identity not in candidates]
+            deadline = time.monotonic() + timeout
+            last_error = None
+            for identity in candidates:
+                if self._retry_at.get(identity, 0) > time.monotonic():
+                    continue
+                budget = min(deadline - time.monotonic(), max(1, timeout / len(candidates)))
+                if budget <= 0:
+                    break
+                # Missing metadata/credentials are configuration errors. Do not
+                # hide them by silently selecting a different server.
+                profile = self._resolve(identity)
+                try:
+                    if forward_http:
+                        sock, tail = open_proxy(profile, budget, on_socket), b""
+                    else:
+                        sock, tail = connect_upstream(profile, host, port, budget, on_socket)
+                except OSError as error:
+                    phase = getattr(error, "devproxy_phase", None)
+                    if phase not in ("proxy_tcp", "proxy_tls") or isinstance(error, ssl.SSLCertVerificationError):
+                        raise
+                    if isinstance(error, ssl.SSLError) and not isinstance(error, (ssl.SSLEOFError, ssl.SSLZeroReturnError)):
+                        raise
+                    last_error = error
+                    count = min(self._failures.get(identity, 0) + 1, 5)
+                    self._failures[identity] = count
+                    self._retry_at[identity] = time.monotonic() + min(300, 15 * 2 ** (count - 1))
+                    continue
+                self._selected_id = identity
+                self._selected_name = profile.name
+                self._retry_at.pop(identity, None)
+                self._failures.pop(identity, None)
+                return sock, tail, profile
+            if last_error is not None:
+                raise last_error
+            raise ProxyError("All configured routes are unavailable", "routes_unavailable")
+
+
+def rename_affected_policies(old_name, new_name):
+    """Return background app ids that still point at a profile name."""
+    state = StateManager.load_state().get("background", {})
+    return sorted(app_id for app_id, policy in state.get("applications", {}).items()
+                  if policy.get("profile") == old_name)
+
+
 def choose_adapter(name):
     return get_adapter(name) or GenericApplicationAdapter(name)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="DevProxy Windows application proxy sessions (Phase 1)")
+    parser.add_argument("--version", action="version", version="DevProxy " + __version__)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--self-test-ui", action="store_true", help=argparse.SUPPRESS)
     sub = parser.add_subparsers(dest="command")
@@ -148,7 +279,8 @@ def main(argv=None):
                 print("Backend: native/environment; no enforced per-app fail-closed guarantee")
                 return 0
             print("WARN native/environment mode: applications or children ignoring proxy settings can connect directly.")
-            with ApplicationSession(profile) as session:
+            provider = SavedProfileProvider(profile.name) if not args.proxy else None
+            with ApplicationSession(profile, profile_provider=provider) as session:
                 if args.require_fail_closed:
                     session.start(require_fail_closed=True)
                 session.launch(executable, adapter.get_cli_launch_flags(profile), extra, adapter.electron,

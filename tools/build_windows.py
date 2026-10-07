@@ -44,8 +44,10 @@ def main():
     run("-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--windowed",
         "--name", "devproxy-gui", "--distpath", str(output), *data_args, "devproxy_gui.py")
     subprocess.run([str(output / "devproxy.exe"), "--help"], check=True)
-    subprocess.run([str(output / "devproxy.exe"), "--self-test-ui"], check=True, timeout=30)
-    subprocess.run([str(output / "devproxy-gui.exe"), "--self-test"], check=True, timeout=30)
+    # A cold onefile extraction plus antivirus scanning can exceed 30s on
+    # Windows. Keep a bounded gate, with enough time for first-run scanning.
+    subprocess.run([str(output / "devproxy.exe"), "--self-test-ui"], check=True, timeout=90)
+    subprocess.run([str(output / "devproxy-gui.exe"), "--self-test"], check=True, timeout=90)
     with zipfile.ZipFile(output / "devproxy-windows-x64.zip", "w", zipfile.ZIP_DEFLATED) as archive:
         for name in ("devproxy.exe", "devproxy-gui.exe"):
             archive.write(output / name, name)

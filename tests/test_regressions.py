@@ -266,7 +266,13 @@ class ProtocolTests(unittest.TestCase):
         with mock.patch("socket.create_connection", side_effect=ConnectionRefusedError) as dial:
             with self.assertRaises(ConnectionRefusedError):
                 connect_upstream(profile, "destination.invalid", 443)
-            dial.assert_called_once_with(("proxy.invalid", 8080), timeout=10.0)
+            dial.assert_called_once()
+            address, = dial.call_args.args
+            self.assertEqual(address, ("proxy.invalid", 8080))
+            # The dial budget shares one overall handshake deadline, so assert
+            # the bound rather than a byte-exact float.
+            self.assertLessEqual(dial.call_args.kwargs["timeout"], 10.0)
+            self.assertGreater(dial.call_args.kwargs["timeout"], 9.0)
 
     def test_public_listener_refused(self):
         with self.assertRaises(ValueError):

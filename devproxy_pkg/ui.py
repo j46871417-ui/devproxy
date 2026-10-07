@@ -3,22 +3,25 @@ import os
 import queue
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import uuid
+from functools import partial
 
 from .adapters import get_adapter
 from .adapters.generic import GenericApplicationAdapter
-from .cli import resolve_profile
+from .cli import resolve_profile, resolve_saved_profile, SavedProfileProvider
 from .core.launcher import ApplicationSession
 from .core.profile import ProxyProfile
-from .core.profiles import persist_profile, profile_from_fields
+from .core.profiles import persist_profile, profile_from_fields, set_route_backups
 from .core.recovery import StateManager
 from .core.secrets import SecretStore
 from .core.transport import connect_upstream
 from .core.user_errors import describe_error, UserInputError
 from .discovery import canonical, discover_applications, merge_applications
 from .ui_editing import editable_entry
+from . import __version__
 
 
 def check_proxy(profile, target):
@@ -183,7 +186,10 @@ class DevProxyWindow:
         self.background = background
         self.tray = None
         self.background_closing = self.persistent_busy = False
-        root.title("DevProxy — прокси для приложений")
+        self._background_error = None
+        self._snapshot_at = 0.0
+        self._status_refresh_pending = threading.Event()
+        root.title("DevProxy " + __version__ + " — прокси для приложений")
         root.geometry("1040x760")
         root.minsize(860, 650)
         style = ttk.Style(root)
@@ -226,6 +232,10 @@ class DevProxyWindow:
         self.target_entry = editable_entry(target_line, textvariable=self.target, width=26)
         self.target_entry.pack(side="left", padx=8)
         ttk.Label(target_line, text="Если сайт заблокирован вашим прокси, укажите другой.").pack(side="left")
+        network_tools = ttk.Frame(proxy_box)
+        network_tools.pack(fill="x", pady=(6, 0))
+        ttk.Button(network_tools, text="Резервные прокси…", command=self.route_backups).pack(side="left")
+        ttk.Button(network_tools, text="Вход Antigravity через прокси…", command=self.login_antigravity).pack(side="left", padx=8)
         footer = ttk.Frame(frame)
         footer.pack(side="bottom", fill="x")
         apps_box = ttk.LabelFrame(frame, text="Приложения — установленные IDE и инструменты добавляются автоматически", padding=12)
@@ -326,6 +336,82 @@ class DevProxyWindow:
 
     def add_profile(self):
         ProfileDialog(self)
+
+    def route_backups(self):
+        name = self.profile.get()
+        if not name:
+            self.status.set("Сначала добавьте и выберите основной прокси.")
+            return
+        profiles = StateManager.list_profiles()
+        primary = profiles.get(name, {})
+        saved = StateManager.load_state().get("route_groups", {}).get(primary.get("profile_id"), [])
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Резервные прокси")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        ttk.Label(dialog, text="Основной прокси: " + name, padding=12).pack(anchor="w")
+        ttk.Label(dialog, text="Выберите до четырёх резервов. Выход сохраняется для сессии.\n"
+                  "Переключение возможно до CONNECT; отказ сайта или пароля не обходится.\n"
+                  "Добавьте серверы своих стран как обычные профили. Российский вход\n"
+                  "включайте только при наличии настроенного маршрута через него.", padding=12).pack(anchor="w")
+        choices = []
+        for other, data in profiles.items():
+            if other == name:
+                continue
+            selected = tk.BooleanVar(value=data.get("profile_id") in saved)
+            ttk.Checkbutton(dialog, text=other, variable=selected).pack(anchor="w", padx=12, pady=3)
+            choices.append((other, selected))
+        def save():
+            try:
+                set_route_backups(name, [other for other, value in choices if value.get()])
+                self.status.set("Резервные прокси сохранены. Уже открытые соединения продолжают работу.")
+                dialog.destroy()
+            except Exception as error:
+                messagebox.showerror("Не удалось сохранить", describe_error(error), parent=dialog)
+        ttk.Button(dialog, text="Сохранить", command=save).pack(padx=12, pady=12)
+
+    def login_antigravity(self):
+        from .core.oauth_browser import latest_login_url, find_browser, launch_login_browser
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Вход Antigravity через выбранный прокси")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        ttk.Label(dialog, text="Нажмите вход в Antigravity. Вставьте полученную ссылку Google.\n"
+                  "Свежая ссылка из журнала подставляется автоматически. Откроется\n"
+                  "отдельный браузер через тот же прокси; код входа верните в Antigravity.", padding=12).pack()
+        url = tk.StringVar(value=latest_login_url() or "")
+        editable_entry(dialog, textvariable=url, width=72, show="").pack(padx=12, fill="x")
+        browser = find_browser()
+        result = tk.StringVar(value="")
+        ttk.Label(dialog, textvariable=result, wraplength=520).pack(padx=12, pady=6)
+        def open_browser():
+            nonlocal browser
+            if not browser:
+                browser = filedialog.askopenfilename(parent=dialog, title="Выберите Chrome, Edge, Brave или Яндекс Браузер",
+                                                     filetypes=[("Приложения Windows", "*.exe")])
+                if not browser:
+                    return
+            value = url.get()
+            result.set("Открываем браузер входа…")
+            button.configure(state="disabled")
+            def work():
+                try:
+                    if self.session and any(r.get("id") == "antigravity" for r in getattr(self, "_manual_records", [])):
+                        session = self.session
+                    else:
+                        with self.background.lock:
+                            state = StateManager.load_state().get("background", {})
+                            name = state.get("applications", {}).get("antigravity", {}).get("profile")
+                            if not name:
+                                raise UserInputError("Сначала запустите Antigravity или включите для неё постоянный режим.")
+                            session = self.background._session(name, state["ports"][name])
+                    launch_login_browser(session, value, browser)
+                    self.events.put(("oauth_result", dialog, result, button, "Браузер открыт через прокси Antigravity. Завершите вход и верните код в приложение."))
+                except Exception as error:
+                    self.events.put(("oauth_result", dialog, result, button, describe_error(error)))
+            threading.Thread(target=work, daemon=True, name="DevProxyOAuth").start()
+        button = ttk.Button(dialog, text="Открыть вход через прокси", command=open_browser)
+        button.pack(padx=12, pady=12)
 
     def edit_profile(self):
         if not self.profile.get():
@@ -492,7 +578,8 @@ class DevProxyWindow:
                 # permit the IDE's services while rejecting the check site.
                 if self.cancel.is_set():
                     return
-                session = ApplicationSession(profile).start()
+                session = ApplicationSession(profile, bind_port=0,
+                                             profile_provider=SavedProfileProvider(name)).start()
                 for record in selected:
                     if self.cancel.is_set():
                         break
@@ -568,9 +655,7 @@ class DevProxyWindow:
                         self.shutdown()
                         result = {"ok": True}
                     elif message.get("command") == "status":
-                        result = {"ok": True, "applications": list(self.background.policies()),
-                                  "ports": {k:v.tunnel.allocated_port for k,v in self.background.sessions.items()},
-                                  "error": self.background.last_error}
+                        result = self.status_snapshot()
                     elif message.get("command") == "launch" and not self.persistent_busy:
                         arguments = message.get("arguments", [])
                         if not isinstance(arguments, list) or len(arguments) > 100 or any(not isinstance(a,str) or len(a)>4096 for a in arguments):
@@ -589,6 +674,11 @@ class DevProxyWindow:
                 self.render_apps()
             elif kind == "background_closed":
                 self.background_closing = False
+            elif kind == "oauth_result":
+                dialog, result, button, text = event[1:]
+                if dialog.winfo_exists():
+                    result.set(text)
+                    button.configure(state="normal")
             elif kind == "tray_error":
                 self.show()
                 self.status.set("Значок в трее недоступен. Окно оставлено открытым.")
@@ -614,6 +704,7 @@ class DevProxyWindow:
                 self.status.set(event[1])
             elif kind == "started":
                 self.session = event[1]
+                self._manual_records = event[2]
                 if self.cancel.is_set():
                     self.stop()
                 else:
@@ -632,11 +723,12 @@ class DevProxyWindow:
         if self.session:
             try:
                 if self.session.tunnel.last_error:
-                    self.status.set("Соединение с прокси прервалось. Туннель не переключается напрямую. Проверьте прокси; часть приложений может игнорировать его настройки.")
+                    self.status.set(self.session.tunnel.last_error)
                 if not self.session.active():
                     self.stop()
             except OSError:
                 self.stop()
+        self.report_background_failure()
         busy = self.worker and self.worker.is_alive()
         if not busy and not self.session:
             self.set_controls(False)
@@ -644,6 +736,57 @@ class DevProxyWindow:
             self.root.destroy()
             return
         self.root.after(100, self.poll)
+
+    def report_background_failure(self):
+        """Surface a persistent-tunnel failure without blocking the window.
+
+        The manager keeps a non-blocking cache, so this never waits on the lock
+        that enable/disable holds during file work. A problem is announced once
+        per distinct message so it cannot keep overwriting the result of the
+        user's own action; a healthy status clears it again.
+        """
+        if not self.background or self.persistent_busy or self.worker and self.worker.is_alive():
+            return
+        now = time.monotonic()
+        if now - self._snapshot_at >= 1.0 and not self._status_refresh_pending.is_set():
+            self._snapshot_at = now
+            self._status_refresh_pending.set()
+            def refresh():
+                try:
+                    self.background.refresh()
+                finally:
+                    self._status_refresh_pending.clear()
+            threading.Thread(target=refresh, daemon=True,
+                             name="DevProxyStatus").start()
+        try:
+            error = self.background.snapshot().get("error")
+        except Exception:
+            return
+        if not error:
+            self._background_error = None
+            return
+        message = "Фоновый прокси: " + error
+        if self._background_error == error or self.status.get() == message:
+            return
+        self._background_error = error
+        if not self.session:
+            self.status.set(message)
+
+    def status_snapshot(self):
+        """IPC status. Reads only cached state, so it cannot stall on file work."""
+        snapshot = self.background.snapshot() if self.background else {}
+        sessions = list(snapshot.get("sessions", []))
+        ports = dict(snapshot.get("ports", {}))
+        applications = list(snapshot.get("applications", []))
+        error = snapshot.get("error")
+        if self.session:
+            sessions.append(dict(self.session.tunnel.diagnostics(), mode="manual"))
+        failures = [entry for session in sessions for entry in session.get("failures", [])]
+        if failures:
+            error = max(failures, key=lambda entry: entry.get("time", 0))["message"]
+        # Messages are produced by describe_error and never embed credentials.
+        return {"ok": True, "applications": applications, "ports": ports,
+                "error": error, "sessions": sessions, "version": __version__}
 
     def show(self):
         self.root.deiconify()

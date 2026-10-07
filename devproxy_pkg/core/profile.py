@@ -16,6 +16,7 @@ class ProxyProfile:
     dns_remote: bool = True
     notes: Optional[str] = None
     secret_reference: Optional[str] = None
+    profile_id: Optional[str] = None
 
     def __post_init__(self):
         self.protocol = self.protocol.lower()
@@ -65,7 +66,7 @@ class ProxyProfile:
             raise ValueError("Secret serialization is prohibited")
         return dict(name=self.name, protocol=self.protocol, host=self.host, port=self.port,
                     username=self.username, dns_remote=self.dns_remote, notes=self.notes,
-                    secret_reference=self.secret_reference)
+                    secret_reference=self.secret_reference, profile_id=self.profile_id)
 
     @classmethod
     def from_dict(cls, data, password=None):
@@ -74,7 +75,7 @@ class ProxyProfile:
         return cls(name=data["name"], protocol=data.get("protocol", "http"), host=data["host"],
                    port=data["port"], username=data.get("username"), password=password,
                    dns_remote=data.get("dns_remote", True), notes=data.get("notes"),
-                   secret_reference=data.get("secret_reference"))
+                   secret_reference=data.get("secret_reference"), profile_id=data.get("profile_id"))
 
     @classmethod
     def parse(cls, raw, name="default", fallback_protocol="http"):

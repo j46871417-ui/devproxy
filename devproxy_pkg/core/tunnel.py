@@ -8,20 +8,57 @@ import threading
 import time
 import urllib.parse
 import uuid
+from collections import OrderedDict, deque
+from dataclasses import replace
 from .transport import connect_upstream, open_proxy, auth_header, read_headers, ProxyError
 from .user_errors import describe_error
 
 LOG = logging.getLogger("devproxy.tunnel")
 
+MAX_FAILURES = 16
+MAX_HISTORY = 32
+MAX_BUFFER = 65536
+CHUNK = 32768
+
+
+def snapshot_profile(provider, fallback):
+    """One immutable view of the profile for a single new connection.
+
+    The provider reads current saved metadata and the secret together, so a
+    connection never mixes a new port with an old password. Existing streams
+    keep the object they opened with; only new streams see the update.
+    """
+    if provider is None:
+        return fallback
+    try:
+        profile = provider()
+    except Exception as error:
+        raise _profile_error(error) from None
+    if profile is None:
+        raise _profile_error(None)
+    return replace(profile)
+
+
+def _profile_error(cause):
+    error = ProxyError("Сохранённый профиль недоступен"
+                       + (": " + type(cause).__name__ if cause is not None else ""),
+                       "profile_unavailable")
+    # Stage is set here so later handshake code cannot relabel it as a connect
+    # failure, and so diagnostics can name the real cause.
+    error.devproxy_phase = "profile"
+    return error
+
 
 class LocalTunnel:
     def __init__(self, profile, bind_host="127.0.0.1", bind_port=0,
-                 max_connections=64, handshake_timeout=10.0, idle_timeout=120.0):
+                 max_connections=64, handshake_timeout=10.0, idle_timeout=120.0,
+                 profile_provider=None):
         if not ipaddress.ip_address(bind_host).is_loopback:
             raise ValueError("Local listener must use a loopback address")
         if max_connections < 1 or handshake_timeout <= 0 or idle_timeout <= 0:
             raise ValueError("Limits and timeouts must be positive")
         self.profile, self.bind_host, self.bind_port = profile, bind_host, bind_port
+        self.profile_provider = profile_provider
         self.handshake_timeout, self.idle_timeout = handshake_timeout, idle_timeout
         self.server_sock = None
         self.allocated_port = 0
@@ -33,6 +70,39 @@ class LocalTunnel:
         self._stop = threading.Event()
         self.session_id = uuid.uuid4().hex
         self.last_error = None
+        self._failures = OrderedDict()
+        self._history = deque(maxlen=MAX_HISTORY)
+        self._success_count = self._failure_count = 0
+
+    def _record_failure(self, error, host, port, phase):
+        entry = {"host": host, "port": port, "phase": getattr(error, "devproxy_phase", phase),
+                 "type": type(error).__name__, "code": getattr(error, "code", None),
+                 "status": getattr(error, "status", None), "time": time.time(),
+                 "message": describe_error(error, host)}
+        with self._lock:
+            key = (host, port)
+            self._failures.pop(key, None)
+            self._failures[key] = entry
+            while len(self._failures) > MAX_FAILURES:
+                self._failures.popitem(last=False)
+            self._history.append(entry)
+            self._failure_count += 1
+            self.last_error = entry["message"]
+
+    def _record_success(self, host, port):
+        """Clear only this destination's error; other destinations stay visible."""
+        with self._lock:
+            self._failures.pop((host, port), None)
+            self._success_count += 1
+            self.last_error = next(reversed(self._failures.values()))["message"] if self._failures else None
+
+    def diagnostics(self):
+        with self._lock:
+            route = self.profile_provider.route_status() if hasattr(self.profile_provider, "route_status") else None
+            return {"profile": self.profile.name, "port": self.allocated_port, "running": self.is_running,
+                    "connections": len(self._workers), "succeeded": self._success_count,
+                    "failed": self._failure_count, "failures": [dict(e) for e in self._failures.values()],
+                    "recent_failures": [dict(e) for e in self._history], "error": self.last_error, "route": route}
 
     @property
     def proxy_url(self):
@@ -68,7 +138,10 @@ class LocalTunnel:
             sock.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
-        sock.close()
+        try:
+            sock.close()
+        except OSError:
+            pass
 
     def stop(self):
         with self._lock:
@@ -134,6 +207,7 @@ class LocalTunnel:
         upstream = None
         established = False
         valid_request = False
+        host = port = None
         try:
             client.settimeout(self.handshake_timeout)
             headers, tail = read_headers(client)
@@ -143,12 +217,17 @@ class LocalTunnel:
                 raise ValueError("Invalid request line")
             host, port, parsed = self._destination(target, method == "CONNECT")
             valid_request = True
-            forward_http = method != "CONNECT" and not self.profile.is_socks
-            if forward_http:
-                upstream = open_proxy(self.profile, self.handshake_timeout, self._track)
+            profile = snapshot_profile(self.profile_provider, self.profile)
+            forward_http = method != "CONNECT" and not profile.is_socks
+            connector = getattr(self.profile_provider, "open_connection", None)
+            if connector is not None:
+                upstream, upstream_tail, profile = connector(host, port, self.handshake_timeout,
+                                                            self._track, forward_http)
+            elif forward_http:
+                upstream = open_proxy(profile, self.handshake_timeout, self._track)
                 upstream_tail = b""
             else:
-                upstream, upstream_tail = connect_upstream(self.profile, host, port, self.handshake_timeout, self._track)
+                upstream, upstream_tail = connect_upstream(profile, host, port, self.handshake_timeout, self._track)
             if method == "CONNECT":
                 client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n" + upstream_tail)
             else:
@@ -157,23 +236,22 @@ class LocalTunnel:
                     path = urllib.parse.urlunsplit(("http", parsed.netloc, parsed.path or "/", parsed.query, ""))
                 clean = [line for line in lines[1:] if not line.lower().startswith((b"proxy-authorization:", b"proxy-connection:", b"connection:"))]
                 request = f"{method} {path} {protocol}\r\n".encode("ascii")
-                credentials = auth_header(self.profile) if forward_http else b""
+                credentials = auth_header(profile) if forward_http else b""
                 upstream.sendall(request + b"\r\n".join(clean) + b"\r\n" + credentials + b"Connection: close\r\n\r\n")
                 if upstream_tail:
                     client.sendall(upstream_tail)
             established = True
-            self.last_error = None
+            self._record_success(host, port)
             if tail:
                 upstream.sendall(tail)
             self._pipe_duplex(client, upstream)
         except (ValueError, UnicodeError) as exc:
-            if not established:
-                if valid_request:
-                    self.last_error = describe_error(exc, host if 'host' in locals() else "целевой сервер")
-                self._error(client, 502 if valid_request else 400, "Bad Gateway" if valid_request else "Bad Request")
+            if not established and valid_request:
+                self._record_failure(exc, host, port, "profile")
+            self._error(client, 502 if valid_request else 400, "Bad Gateway" if valid_request else "Bad Request")
         except Exception as exc:
-            if not self._stop.is_set():
-                self.last_error = describe_error(exc, host if 'host' in locals() else "целевой сервер")
+            if not self._stop.is_set() and valid_request:
+                self._record_failure(exc, host, port, "relay" if established else "connect")
             LOG.warning("connection_failed session=%s error=%s", self.session_id, type(exc).__name__)
             if not established:
                 self._error(client, 502, "Bad Gateway")
@@ -195,9 +273,37 @@ class LocalTunnel:
         except OSError:
             pass
 
+    @staticmethod
+    def _half_close(sock):
+        """Close only the write direction of a *plain* socket.
+
+        ``socket.shutdown(SHUT_WR)`` acts on the raw file descriptor. On an
+        ``SSLSocket`` that bypasses OpenSSL: it emits a bare TCP FIN with no TLS
+        close_notify and desynchronises the record layer, so the peer then reads
+        ciphertext instead of plaintext (reproduced: a 256 KiB echo over an
+        HTTPS proxy arrives corrupted at the first half-close). Calling
+        ``unwrap()`` instead is not safe either -- it waits for the peer's
+        close_notify and truncates the stream under a non-blocking relay.
+
+        TLS endpoints are therefore left open in the write direction; the relay
+        keeps serving the opposite direction and the final close tears the
+        connection down. Returns True only when an fd-level half-close happened.
+        """
+        if isinstance(sock, ssl.SSLSocket):
+            return False
+        try:
+            sock.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        return True
+
     def _pipe_duplex(self, client, upstream):
+        """Bounded relay with direction-aware SSL retries and visible failures."""
         peers = {client: upstream, upstream: client}
-        buffers = {client: bytearray(), upstream: bytearray()}
+        buffers = {sock: bytearray() for sock in peers}
+        pending = {sock: None for sock in peers}
+        read_wait = {sock: "read" for sock in peers}
+        write_wait = {sock: "write" for sock in peers}
         eof, write_closed = set(), set()
         for sock in peers:
             sock.setblocking(False)
@@ -205,38 +311,60 @@ class LocalTunnel:
         while not self._stop.is_set():
             for source, dest in peers.items():
                 if source in eof and not buffers[dest] and dest not in write_closed:
-                    try:
-                        dest.shutdown(socket.SHUT_WR)
-                    except OSError:
-                        pass
+                    self._half_close(dest)
                     write_closed.add(dest)
             if len(eof) == 2 and not any(buffers.values()):
-                break
+                return
             remaining = self.idle_timeout - (time.monotonic() - last_activity)
             if remaining <= 0:
-                break
-            readers = [s for s in peers if s not in eof and len(buffers[peers[s]]) < 65536]
-            writers = [s for s in peers if buffers[s]]
-            buffered = [s for s in readers if hasattr(s, "pending") and s.pending()]
-            ready, writable, errors = select.select(readers, writers, list(peers), 0 if buffered else min(0.2, remaining))
-            ready = list(dict.fromkeys(buffered + ready))
+                return
+            read_ops = [s for s in peers if s not in eof and len(buffers[peers[s]]) < MAX_BUFFER]
+            write_ops = [s for s in peers if buffers[s]]
+            readers = list({s for s in read_ops if read_wait[s] == "read"} |
+                           {s for s in write_ops if write_wait[s] == "read"})
+            writers = list({s for s in read_ops if read_wait[s] == "write"} |
+                           {s for s in write_ops if write_wait[s] == "write"})
+            decrypted = {s for s in read_ops if read_wait[s] == "read"
+                         and getattr(s, "pending", None) and s.pending()}
+            ready, writable, errors = select.select(readers, writers, list(peers),
+                                                    0 if decrypted else min(.2, remaining))
+            if self._stop.is_set():
+                return
             if errors:
-                break
-            for dest in writable:
+                raise ConnectionResetError("Socket exception during relay")
+            ready, writable = set(ready) | decrypted, set(writable)
+            for dest in write_ops:
+                if dest not in (ready if write_wait[dest] == "read" else writable):
+                    continue
+                if pending[dest] is None:
+                    pending[dest] = bytes(buffers[dest][:CHUNK])
                 try:
-                    size = dest.send(buffers[dest])
+                    size = dest.send(pending[dest])
                     if not size:
-                        raise OSError("Peer closed during send")
-                    del buffers[dest][:size]
-                    last_activity = time.monotonic()
-                except (BlockingIOError, ssl.SSLWantReadError, ssl.SSLWantWriteError):
-                    pass
-            for source in ready:
+                        raise ConnectionResetError("Peer closed during send")
+                except ssl.SSLWantReadError:
+                    write_wait[dest] = "read"
+                    continue
+                except (BlockingIOError, InterruptedError, ssl.SSLWantWriteError):
+                    write_wait[dest] = "write"
+                    continue
+                del buffers[dest][:size]
+                pending[dest] = None
+                write_wait[dest] = "write"
+                last_activity = time.monotonic()
+            for source in read_ops:
+                if source not in (ready if read_wait[source] == "read" else writable):
+                    continue
                 dest = peers[source]
                 try:
-                    data = source.recv(min(32768, 65536 - len(buffers[dest])))
-                except (BlockingIOError, ssl.SSLWantReadError, ssl.SSLWantWriteError):
+                    data = source.recv(min(CHUNK, MAX_BUFFER - len(buffers[dest])))
+                except ssl.SSLWantWriteError:
+                    read_wait[source] = "write"
                     continue
+                except (BlockingIOError, InterruptedError, ssl.SSLWantReadError):
+                    read_wait[source] = "read"
+                    continue
+                read_wait[source] = "read"
                 if data:
                     buffers[dest].extend(data)
                     last_activity = time.monotonic()

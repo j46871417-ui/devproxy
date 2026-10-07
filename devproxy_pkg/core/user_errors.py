@@ -12,6 +12,8 @@ def describe_error(error, target="github.com"):
     if isinstance(error, UserInputError):
         return str(error)
     if isinstance(error, ProxyError):
+        if error.code == "routes_unavailable":
+            return f"Все выбранные прокси временно недоступны для {target}. Прямое подключение не выполняется; повторите позже или выберите другой профиль."
         if error.code == "auth_failed":
             hint = f" (HTTP {error.status})" if error.status else ""
             return (
@@ -44,16 +46,43 @@ def describe_error(error, target="github.com"):
                 f"Причина: SOCKS5-прокси запретил или не смог открыть {target}.\n"
                 f"Что делать: проверьте ограничения и DNS на стороне прокси."
             )
+        if error.code == "profile_unavailable":
+            return (
+                "Этап: чтение сохранённого профиля прокси.\n"
+                "Причина: профиль удалён, переименован или его пароль больше недоступен.\n"
+                "Что делать: выберите профиль заново или нажмите «Изменить» и сохраните пароль. "
+                "Прямое подключение не выполняется."
+            )
         return (
-            "Этап: проверка сетевого протокола.\n"
+            f"Этап: проверка сетевого протокола при подключении к {target}.\n"
             "Причина: ответ сервера не соответствует выбранному типу прокси.\n"
             "Что делать: проверьте HTTP/SOCKS5 и порт."
         )
-    if isinstance(error, ssl.SSLError):
+    # Order matters: SSLCertVerificationError is an SSLError subclass, and an
+    # unexpected EOF is a truncated connection, not a trust failure.
+    if isinstance(error, ssl.SSLCertVerificationError):
+        return (
+            "Этап: проверка сертификата прокси.\n"
+            "Причина: сертификат прокси недействителен или не является доверенным.\n"
+            "Что делать: проверьте адрес и сертификат прокси; проверка сертификатов не отключается."
+        )
+    if isinstance(error, ssl.SSLEOFError):
         return (
             "Этап: защищённое TLS-соединение с прокси.\n"
-            "Причина: ошибка защищённого соединения с прокси (недействительный или недоверенный сертификат).\n"
-            "Что делать: проверьте его сертификат и тип подключения HTTPS; проверка сертификатов не отключается."
+            "Причина: прокси закрыл TLS-соединение до завершения обмена (не ошибка доверия сертификату).\n"
+            "Что делать: повторите подключение и проверьте HTTPS-порт прокси; сертификат при этом не игнорируется."
+        )
+    if isinstance(error, ssl.SSLError):
+        if getattr(error, "reason", None) == "WRONG_VERSION_NUMBER":
+            return (
+                "Этап: защищённое TLS-соединение с прокси.\n"
+                "Причина: сервер на этом порту не поддерживает HTTPS.\n"
+                "Что делать: проверьте тип прокси и порт; проверка TLS не отключается."
+            )
+        return (
+            "Этап: защищённое TLS-соединение с прокси.\n"
+            "Причина: ошибка протокола TLS при обмене с прокси.\n"
+            "Что делать: проверьте HTTPS-порт и тип подключения; проверка сертификатов не отключается."
         )
     if isinstance(error, socket.gaierror):
         return (

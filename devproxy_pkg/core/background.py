@@ -3,6 +3,7 @@ import copy
 import os
 from pathlib import Path
 import threading
+from functools import partial
 from .launcher import ApplicationSession
 from .recovery import StateManager, state_lock
 from .shortcuts import inspect_shortcuts, broker_shortcut, write_shortcut, LoginStartup
@@ -13,20 +14,83 @@ class BackgroundManager:
         self.sessions = {}
         self.lock = threading.RLock()
         self.last_error = None
+        # Cache for the GUI/IPC status path. ``lock`` is held across the file
+        # operations of enable/disable, so a blocking read from a Tk callback
+        # could freeze the window; this cache is refreshed after every real
+        # mutation and read without touching that lock.
+        self._cache = {"applications": [], "ports": {}, "sessions": [], "error": None, "revision": 0}
+        self._cache_lock = threading.Lock()
 
     def policies(self):
         return StateManager.load_state().get("background", {}).get("applications", {})
 
     def _session(self, profile_name, port):
+        self._sync_profile_names()
         existing = self.sessions.get(profile_name)
         if existing and not existing.closed:
             if existing.tunnel.allocated_port != port:
                 raise RuntimeError("Локальный порт профиля изменён; перезапустите фоновый агент.")
             return existing
-        from ..cli import resolve_profile
-        session = ApplicationSession(resolve_profile(profile_name), bind_port=port).start()
+        from ..cli import resolve_profile, SavedProfileProvider
+        session = ApplicationSession(resolve_profile(profile_name), bind_port=port,
+                                     profile_provider=SavedProfileProvider(profile_name)).start()
         self.sessions[profile_name] = session
         return session
+
+    def _sync_profile_names(self):
+        """Rekey live bridges by the stable profile identity after a rename."""
+        profiles = StateManager.list_profiles()
+        for old_name, session in list(self.sessions.items()):
+            identity = getattr(session.tunnel.profile_provider, "profile_id", None)
+            if not isinstance(identity, str):
+                continue
+            names = [name for name, data in profiles.items() if data.get("profile_id") == identity]
+            if len(names) == 1 and names[0] != old_name:
+                new_name = names[0]
+                if new_name in self.sessions and self.sessions[new_name] is not session:
+                    raise RuntimeError("Профиль уже связан с другим действующим мостом.")
+                self.sessions[new_name] = self.sessions.pop(old_name)
+                with session.tunnel._lock:
+                    session.tunnel.profile.name = new_name
+
+    def snapshot(self):
+        """Non-blocking status view for the GUI and IPC; never takes ``lock``."""
+        with self._cache_lock:
+            cached = self._cache
+            return {"applications": list(cached["applications"]), "ports": dict(cached["ports"]),
+                    "sessions": [dict(item) for item in cached["sessions"]],
+                    "error": cached["error"], "revision": cached["revision"]}
+
+    def refresh(self):
+        """Rebuild the status cache. Call from a worker, never from a Tk callback."""
+        if not self.lock.acquire(blocking=False):
+            return
+        try:
+            self._refresh_locked()
+        finally:
+            self.lock.release()
+
+    def _refresh_locked(self):
+        self._sync_profile_names()
+        sessions = []
+        ports = {}
+        for name, session in list(self.sessions.items()):
+            try:
+                ports[name] = session.tunnel.allocated_port
+                sessions.append(dict(session.tunnel.diagnostics(), mode="persistent", profile=name))
+            except Exception:
+                continue
+        try:
+            applications = sorted(self.policies())
+        except Exception:
+            applications = []
+        failures = [entry for item in sessions for entry in item.get("failures", [])]
+        error = self.last_error
+        if failures:
+            error = max(failures, key=lambda entry: entry.get("time", 0))["message"]
+        with self._cache_lock:
+            self._cache = {"applications": applications, "ports": ports, "sessions": sessions,
+                           "error": error, "revision": self._cache["revision"] + 1}
 
     def resume(self):
         errors = []
@@ -39,6 +103,7 @@ class BackgroundManager:
                     errors.append(name)
             if errors:
                 self.last_error = "Не удалось запустить фоновый прокси: " + ", ".join(errors) + ". Проверьте профиль, пароль и занятость локального порта."
+        self.refresh()
         return errors
 
     def enable(self, records, profile_name):
@@ -117,6 +182,7 @@ class BackgroundManager:
                     self.last_error = "Часть ярлыков требует восстановления. Запись изменений сохранена."
                 raise
             self.last_error = None
+        self.refresh()
         return len(records)
 
     def disable(self, app_ids=None):
@@ -161,12 +227,14 @@ class BackgroundManager:
                     errors.append("автозапуск")
             StateManager.save_state(state)
             active_profiles = {p["profile"] for p in policies.values()}
+            self._sync_profile_names()
             for name in list(self.sessions):
                 if name not in active_profiles:
                     self.sessions.pop(name).stop()
             if errors:
                 raise RuntimeError("Не восстановлены изменённые другой программой ярлыки/автозапуск: " + ", ".join(sorted(set(errors))))
             self.last_error = None
+        self.refresh()
 
     def launch(self, app_id, arguments=None):
         with self.lock:
@@ -188,3 +256,4 @@ class BackgroundManager:
             for session in self.sessions.values():
                 session.stop()
             self.sessions.clear()
+        self.refresh()

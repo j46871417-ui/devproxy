@@ -3,6 +3,29 @@ import base64
 import ipaddress
 import socket
 import ssl
+import time
+import threading
+import weakref
+
+# Only a truncated initial TLS handshake to the proxy is worth retrying: the
+# connection is not yet authenticated and carries no application bytes, so a
+# replay cannot duplicate a request. Everything after CONNECT is never retried.
+TRANSIENT_TLS = (ssl.SSLEOFError, ConnectionResetError, ssl.SSLZeroReturnError)
+HANDSHAKE_ATTEMPTS = 3
+_TLS_GATES = weakref.WeakValueDictionary()
+_TLS_GATES_LOCK = threading.Lock()
+
+
+def _tls_gate(profile):
+    # Bound only initial handshakes per endpoint, not established streams.
+    # Idle endpoints disappear from the registry without growing global state.
+    with _TLS_GATES_LOCK:
+        key = (profile.host, profile.port)
+        gate = _TLS_GATES.get(key)
+        if gate is None:
+            gate = threading.BoundedSemaphore(2)
+            _TLS_GATES[key] = gate
+        return gate
 
 
 class ProxyError(OSError):
@@ -10,6 +33,20 @@ class ProxyError(OSError):
         super().__init__(message)
         self.code = code
         self.status = status
+
+
+def tag_phase(error, phase):
+    """Record the failing stage on the exception for safe diagnostics."""
+    if isinstance(error, Exception) and not hasattr(error, "devproxy_phase"):
+        try:
+            error.devproxy_phase = phase
+        except (AttributeError, TypeError):
+            pass
+    return error
+
+
+def remaining(deadline):
+    return max(0.0, deadline - time.monotonic())
 
 
 def recv_exact(sock, size):
@@ -80,21 +117,100 @@ def auth_header(profile):
     return b"Proxy-Authorization: Basic " + value + b"\r\n"
 
 
-def open_proxy(profile, timeout=10.0, on_socket=None):
-    sock = socket.create_connection((profile.host, profile.port), timeout=timeout)
+def _tls_handshake(plain, host, timeout):
+    """Complete the TLS handshake with certificate verification ON.
+
+    The handshake is driven in blocking mode and the socket is returned to
+    blocking state afterwards. Leaving a manually-driven handshake socket in a
+    half-configured state makes later non-blocking reads hand back raw TLS
+    records instead of plaintext, so the relay must receive a socket whose SSL
+    layer was finalised by a normal, fully blocking handshake.
+    """
+    context = ssl.create_default_context()
+    # Certificate verification stays on: no unverified context, ever.
+    plain.settimeout(timeout)
+    wrapped = context.wrap_socket(plain, server_hostname=host)
     try:
-        if on_socket:
-            on_socket(sock)
-        if profile.protocol == "https":
+        wrapped.settimeout(timeout)
+    except OSError:
+        wrapped.close()
+        raise
+    return wrapped
+
+
+def _discard(sock):
+    if sock is None:
+        return
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+def open_proxy(profile, timeout=10.0, on_socket=None):
+    deadline = time.monotonic() + timeout
+    if profile.protocol != "https":
+        return _open_proxy(profile, timeout, on_socket)
+    gate = _tls_gate(profile)
+    if not gate.acquire(timeout=max(0, remaining(deadline))):
+        raise tag_phase(TimeoutError("Proxy TLS handshake queue deadline exceeded"), "proxy_tls")
+    try:
+        return _open_proxy(profile, remaining(deadline), on_socket)
+    finally:
+        gate.release()
+
+
+def _open_proxy(profile, timeout=10.0, on_socket=None):
+    """Open (and TLS-wrap) the proxy connection.
+
+    Retries are limited to a truncated handshake during the very first TLS
+    negotiation with the proxy, share one overall deadline, and never apply to
+    a certificate or protocol-version error.
+    """
+    deadline = time.monotonic() + timeout
+    last_error = None
+    for attempt in range(HANDSHAKE_ATTEMPTS):
+        budget = remaining(deadline)
+        if budget <= 0:
+            if last_error is not None:
+                raise tag_phase(last_error, "proxy_tls")
+            raise TimeoutError("Proxy handshake deadline exceeded")
+        sock = None
+        phase = "proxy_tcp"
+        try:
+            sock = socket.create_connection((profile.host, profile.port), timeout=budget)
+            if on_socket:
+                on_socket(sock)
+            if profile.protocol != "https":
+                sock.settimeout(max(0.001, remaining(deadline)))
+                return sock
             plain = sock
-            sock = ssl.create_default_context().wrap_socket(sock, server_hostname=profile.host)
+            phase = "proxy_tls"
+            sock = _tls_handshake(plain, profile.host, max(0.001, remaining(deadline)))
             if on_socket:
                 on_socket(sock, plain)
-        sock.settimeout(timeout)
-        return sock
-    except BaseException:
-        sock.close()
-        raise
+            sock.settimeout(max(0.001, remaining(deadline)))
+            return sock
+        except ssl.SSLCertVerificationError as error:
+            # Never retried, never downgraded: report the trust failure as-is.
+            _discard(sock)
+            tag_phase(error, "proxy_tls")
+            raise
+        except BaseException as error:
+            _discard(sock)
+            tag_phase(error, phase)
+            last_error = error
+            retryable = (profile.protocol == "https"
+                         and phase == "proxy_tls"
+                         and isinstance(error, TRANSIENT_TLS)
+                         and not isinstance(error, ssl.SSLCertVerificationError))
+            if not retryable or attempt == HANDSHAKE_ATTEMPTS - 1:
+                raise
+            pause = min(0.1 * (attempt + 1), remaining(deadline))
+            if pause <= 0:
+                raise
+            time.sleep(pause)
+    raise tag_phase(last_error or ProxyError("Proxy handshake failed"), "proxy_tls")
 
 
 def connect_upstream(profile, host, port, timeout=10.0, on_socket=None):
@@ -112,6 +228,9 @@ def connect_upstream(profile, host, port, timeout=10.0, on_socket=None):
             code = int(status[1]) if len(status) >= 2 and status[1].isdigit() else None
             raise ProxyError("HTTP CONNECT rejected", "auth_failed" if code == 407 else "http_rejected", code)
         return sock, tail
-    except BaseException:
+    except BaseException as error:
         sock.close()
+        # Do not relabel an error that already knows its stage (for example a
+        # profile lookup failure raised before this function was entered).
+        tag_phase(error, "proxy_connect")
         raise

@@ -8,6 +8,7 @@ import time
 from .config_editor import ConfigEditor, parse_jsonc
 
 _LOCK = threading.RLock()
+_LOCK_CONTEXT = threading.local()
 
 
 def get_devproxy_state_path():
@@ -18,6 +19,20 @@ def get_devproxy_state_path():
 
 @contextmanager
 def state_lock():
+    with _LOCK:
+        if getattr(_LOCK_CONTEXT, "held", False):
+            yield
+            return
+        with _file_state_lock():
+            _LOCK_CONTEXT.held = True
+            try:
+                yield
+            finally:
+                _LOCK_CONTEXT.held = False
+
+
+@contextmanager
+def _file_state_lock():
     with _LOCK:
         path = get_devproxy_state_path() + ".lock"
         with open(path, "a+b") as file:

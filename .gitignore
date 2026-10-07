@@ -24,3 +24,7 @@ followup-tests.log
 /*.log
 /GEMINI_PROMPT.md
 /ORIGINAL_REQUIREMENTS.md
+/backups/
+/dist-*/
+/logs/
+/_build-*/
