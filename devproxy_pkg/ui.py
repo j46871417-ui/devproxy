@@ -378,7 +378,8 @@ class DevProxyWindow:
         dialog.grab_set()
         ttk.Label(dialog, text="Нажмите вход в Antigravity. Вставьте полученную ссылку Google.\n"
                   "Свежая ссылка из журнала подставляется автоматически. Откроется\n"
-                  "отдельный браузер через тот же прокси; код входа верните в Antigravity.", padding=12).pack()
+                  "отдельный браузер через тот же прокси. Результат входа вернётся\n"
+                  "в Antigravity через локальный адрес; если клиент запросит код, вставьте его.", padding=12).pack()
         url = tk.StringVar(value=latest_login_url() or "")
         editable_entry(dialog, textvariable=url, width=72, show="").pack(padx=12, fill="x")
         browser = find_browser()
@@ -392,7 +393,7 @@ class DevProxyWindow:
                 if not browser:
                     return
             value = url.get()
-            result.set("Открываем браузер входа…")
+            result.set("Проверяем профиль, туннель к Google и локальный адрес возврата…")
             button.configure(state="disabled")
             def work():
                 try:
@@ -406,7 +407,7 @@ class DevProxyWindow:
                                 raise UserInputError("Сначала запустите Antigravity или включите для неё постоянный режим.")
                             session = self.background._session(name, state["ports"][name])
                     launch_login_browser(session, value, browser)
-                    self.events.put(("oauth_result", dialog, result, button, "Браузер открыт через прокси Antigravity. Завершите вход и верните код в приложение."))
+                    self.events.put(("oauth_result", dialog, result, button, "Туннель к Google проверен, браузер открыт. Завершите вход; результат вернётся в Antigravity. Если клиент запросит код, вставьте его в приложение."))
                 except Exception as error:
                     self.events.put(("oauth_result", dialog, result, button, describe_error(error)))
             threading.Thread(target=work, daemon=True, name="DevProxyOAuth").start()

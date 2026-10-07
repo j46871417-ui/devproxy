@@ -137,7 +137,9 @@ class CompletionTests(IsolatedState):
         session.tunnel.session_id = 'fixture'
         session.tunnel.profile_provider = mock.Mock(profile_id='fixture-identity')
         url = 'https://accounts.google.com/o/oauth2/auth?state=fixture'
-        launch_login_browser(session, url, r'C:\browser\msedge.exe')
+        with mock.patch('devproxy_pkg.core.oauth_browser.check_login_tunnel') as check:
+            launch_login_browser(session, url, r'C:\browser\msedge.exe')
+            check.assert_called_once_with(session)
         flags = session.launch.call_args.kwargs['flags']
         self.assertIn('--proxy-server={PROXY_URL}', flags)
         self.assertIn(url, flags)

@@ -112,6 +112,7 @@ class BackgroundManager:
         if not records:
             raise ValueError("Отметьте приложения для постоянного режима.")
         with self.lock, state_lock():
+            previous_sessions = set(self.sessions.values())
             previous = StateManager.load_state()
             if profile_name not in previous.get("profiles", {}):
                 raise ValueError("Выберите сохранённый профиль прокси.")
@@ -134,6 +135,10 @@ class BackgroundManager:
                     raise OSError("Нет свободного локального порта для фонового прокси.")
             else:
                 self._session(profile_name, ports[profile_name])
+            # _session migrates legacy profiles by persisting their stable ID.
+            # Do not overwrite that migration with the pre-session snapshot.
+            # The state lock excludes concurrent profile edits here.
+            state["profiles"] = copy.deepcopy(StateManager.load_state()["profiles"])
             policies = background.setdefault("applications", {})
             ledger = background.setdefault("shortcuts", {})
             edits = []
@@ -178,6 +183,12 @@ class BackgroundManager:
                         rollback_ok = False
                 if rollback_ok:
                     StateManager.save_state(previous)
+                    # A rollback may remove the identity created for a legacy
+                    # profile. Retaining its new bridge would leave a provider
+                    # permanently referring to a profile that no longer exists.
+                    for name, session in list(self.sessions.items()):
+                        if session not in previous_sessions:
+                            self.sessions.pop(name).stop()
                 else:
                     self.last_error = "Часть ярлыков требует восстановления. Запись изменений сохранена."
                 raise
