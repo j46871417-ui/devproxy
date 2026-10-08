@@ -49,6 +49,9 @@ class ApplicationSession:
                          "--ignore-certificate-errors", "--ignore-urlfetcher-cert-requests")
             if any(arg.split("=", 1)[0] in forbidden for arg in extra_args):
                 raise ValueError("Application arguments cannot override session proxy, profile or TLS policy")
+            if electron and os.path.basename(executable).lower() == "antigravity.exe":
+                from .antigravity_recovery import prepare
+                prepare(executable)
             if electron and not preserve_profile:
                 directory = tempfile.TemporaryDirectory(prefix="devproxy-session-")
                 self._directories.append(directory)

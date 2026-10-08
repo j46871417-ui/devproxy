@@ -18,7 +18,8 @@ class BackgroundManager:
         # operations of enable/disable, so a blocking read from a Tk callback
         # could freeze the window; this cache is refreshed after every real
         # mutation and read without touching that lock.
-        self._cache = {"applications": [], "ports": {}, "sessions": [], "error": None, "revision": 0}
+        self._cache = {"applications": [], "policies": [], "startup": False, "loaded": False,
+                       "ports": {}, "sessions": [], "error": None, "revision": 0}
         self._cache_lock = threading.Lock()
 
     def policies(self):
@@ -58,6 +59,8 @@ class BackgroundManager:
         with self._cache_lock:
             cached = self._cache
             return {"applications": list(cached["applications"]), "ports": dict(cached["ports"]),
+                    "policies": [dict(item) for item in cached["policies"]], "startup": cached["startup"],
+                    "loaded": cached["loaded"],
                     "sessions": [dict(item) for item in cached["sessions"]],
                     "error": cached["error"], "revision": cached["revision"]}
 
@@ -71,7 +74,23 @@ class BackgroundManager:
             self.lock.release()
 
     def _refresh_locked(self):
-        self._sync_profile_names()
+        try:
+            self._sync_profile_names()
+            background = StateManager.load_state().get("background", {})
+            rules = background.get("applications", {})
+            applications = sorted(rules)
+            policies = [dict(id=app_id, name=rules[app_id].get("record", {}).get("name", app_id),
+                            profile=rules[app_id]["profile"]) for app_id in applications]
+            startup = bool(background.get("startup"))
+        except Exception:
+            # Preserve the last known rules; a read failure does not mean OFF.
+            self.last_error = "Не удалось прочитать правила постоянного режима."
+            with self._cache_lock:
+                self._cache = dict(self._cache, error=self.last_error, loaded=False,
+                                   revision=self._cache["revision"] + 1)
+            return
+        if self.last_error == "Не удалось прочитать правила постоянного режима.":
+            self.last_error = None
         sessions = []
         ports = {}
         for name, session in list(self.sessions.items()):
@@ -80,16 +99,13 @@ class BackgroundManager:
                 sessions.append(dict(session.tunnel.diagnostics(), mode="persistent", profile=name))
             except Exception:
                 continue
-        try:
-            applications = sorted(self.policies())
-        except Exception:
-            applications = []
         failures = [entry for item in sessions for entry in item.get("failures", [])]
         error = self.last_error
         if failures:
             error = max(failures, key=lambda entry: entry.get("time", 0))["message"]
         with self._cache_lock:
             self._cache = {"applications": applications, "ports": ports, "sessions": sessions,
+                           "policies": policies, "startup": startup, "loaded": True,
                            "error": error, "revision": self._cache["revision"] + 1}
 
     def resume(self):

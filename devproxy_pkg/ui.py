@@ -190,8 +190,8 @@ class DevProxyWindow:
         self._snapshot_at = 0.0
         self._status_refresh_pending = threading.Event()
         root.title("DevProxy " + __version__ + " — прокси для приложений")
-        root.geometry("1040x760")
-        root.minsize(860, 650)
+        root.geometry("1040x940")
+        root.minsize(860, 840)
         style = ttk.Style(root)
         style.theme_use("vista" if "vista" in style.theme_names() else "clam")
         style.configure("Treeview", rowheight=30, font=("Segoe UI", 10))
@@ -206,12 +206,17 @@ class DevProxyWindow:
         self.status = tk.StringVar(value="Добавьте прокси, отметьте приложения и нажмите «Запустить».")
         self.summary = tk.StringVar()
         self.discovery_status = tk.StringVar()
+        self.permanent_status = tk.StringVar()
+        self.permanent_details = tk.StringVar()
+        self.permanent_health = tk.StringVar()
         self.target = tk.StringVar(value="github.com")
         self.rows = {}
-        frame = ttk.Frame(root, padding=20)
+        frame = ttk.Frame(root, padding=12)
         frame.pack(fill="both", expand=True)
-        ttk.Label(frame, text="DevProxy", font=("Segoe UI", 24, "bold")).pack(anchor="w")
-        ttk.Label(frame, text="1. Добавьте прокси     →     2. Отметьте приложения     →     3. Запустите", font=("Segoe UI", 11)).pack(anchor="w", pady=(4, 16))
+        title_line = ttk.Frame(frame)
+        title_line.pack(fill="x")
+        ttk.Label(title_line, text="DevProxy", font=("Segoe UI", 20, "bold")).pack(side="left")
+        ttk.Label(frame, text="1. Добавьте прокси     →     2. Отметьте приложения     →     3. Выберите режим запуска", font=("Segoe UI", 11)).pack(anchor="w", pady=(4, 8))
         proxy_box = ttk.LabelFrame(frame, text="Прокси", padding=12)
         proxy_box.pack(fill="x")
         line = ttk.Frame(proxy_box)
@@ -236,9 +241,20 @@ class DevProxyWindow:
         network_tools.pack(fill="x", pady=(6, 0))
         ttk.Button(network_tools, text="Резервные прокси…", command=self.route_backups).pack(side="left")
         ttk.Button(network_tools, text="Вход Antigravity через прокси…", command=self.login_antigravity).pack(side="left", padx=8)
+        permanent_box = ttk.Frame(frame)
+        permanent_box.pack(fill="x", before=proxy_box, pady=(0, 8))
+        ttk.Button(title_line, text="Что это значит?", command=self.explain_permanent).pack(side="right")
+        self.permanent_label = ttk.Label(title_line, textvariable=self.permanent_status,
+                                         font=("Segoe UI", 11, "bold"))
+        self.permanent_label.pack(side="right", padx=12)
+        self.permanent_details_label = ttk.Label(permanent_box, textvariable=self.permanent_details, wraplength=980)
+        self.permanent_details_label.pack(anchor="w", fill="x")
+        self.permanent_health_label = ttk.Label(permanent_box, textvariable=self.permanent_health,
+                                               foreground="#984800", wraplength=980)
+        self.permanent_health_label.pack(anchor="w", fill="x")
         footer = ttk.Frame(frame)
         footer.pack(side="bottom", fill="x")
-        apps_box = ttk.LabelFrame(frame, text="Приложения — установленные IDE и инструменты добавляются автоматически", padding=12)
+        apps_box = ttk.LabelFrame(frame, text="Приложения — установленные IDE и инструменты добавляются автоматически", padding=8)
         apps_box.pack(fill="both", expand=True, pady=12)
         tools = ttk.Frame(apps_box)
         tools.pack(fill="x", pady=(0, 8))
@@ -254,7 +270,7 @@ class DevProxyWindow:
         table_frame.pack(fill="both", expand=True)
         self.table = ttk.Treeview(table_frame, columns=("use", "name", "kind", "status", "path"), show="headings", selectmode="browse", height=10)
         for key, title, width in (("use", "Выбор", 62), ("name", "Приложение", 165), ("kind", "Тип", 80),
-                                  ("status", "Состояние", 135), ("path", "Расположение", 340)):
+                                  ("status", "Состояние / прокси", 190), ("path", "Расположение", 340)):
             self.table.heading(key, text=title)
             self.table.column(key, width=width, minwidth=50, stretch=key in ("name", "path"), anchor="center" if key == "use" else "w")
         self.table.pack(side="left", fill="both", expand=True)
@@ -269,7 +285,7 @@ class DevProxyWindow:
         self.selected_path_label.pack(side="bottom", anchor="w", pady=(2, 0), before=table_frame)
         self.discovery_label = ttk.Label(apps_box, textvariable=self.discovery_status, wraplength=980)
         self.discovery_label.pack(side="bottom", anchor="w", pady=(4, 0), before=table_frame)
-        self.workflow_label = ttk.Label(footer, text="Запускаются только отмеченные приложения. «Остановить» завершает их и дочерние процессы.", wraplength=980)
+        self.workflow_label = ttk.Label(footer, text="«Запустить выбранные» — разовая сессия. «Остановить» завершает только её приложения.", wraplength=980)
         self.workflow_label.pack(anchor="w")
         self.limit_label = ttk.Label(footer, text="Некоторые приложения могут игнорировать прокси. Полная блокировка прямых подключений пока недоступна.", foreground="#984800", wraplength=980)
         self.limit_label.pack(anchor="w", pady=4)
@@ -279,9 +295,15 @@ class DevProxyWindow:
         self.start_button.pack(side="left")
         self.stop_button = ttk.Button(controls, text="Остановить", command=self.stop, state="disabled")
         self.stop_button.pack(side="left", padx=8)
-        self.status_label = ttk.Label(footer, textvariable=self.status, wraplength=980, font=("Segoe UI", 10))
-        self.status_label.pack(anchor="w")
-        self.enable_button = ttk.Button(controls, text="Включить постоянно", command=self.enable_permanent)
+        status_line = ttk.Frame(footer)
+        status_line.pack(fill="x")
+        self.status_preview = tk.StringVar()
+        self.status.trace_add("write", self.update_status_preview)
+        self.update_status_preview()
+        self.status_label = ttk.Label(status_line, textvariable=self.status_preview, wraplength=850, font=("Segoe UI", 10))
+        self.status_label.pack(side="left", fill="x", expand=True)
+        ttk.Button(status_line, text="Подробности…", command=self.show_status_details).pack(side="right", padx=(8, 0))
+        self.enable_button = ttk.Button(controls, text="Включить для выбранных", command=self.enable_permanent)
         self.enable_button.pack(side="left", padx=8)
         self.disable_button = ttk.Button(controls, text="Вернуть обычный запуск", command=self.disable_permanent)
         self.disable_button.pack(side="left")
@@ -294,6 +316,7 @@ class DevProxyWindow:
         except Exception as error:
             self.status.set(describe_error(error))
         self.render_apps()
+        self.update_permanent_status()
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.after(100, self.poll)
         if auto_discover:
@@ -318,8 +341,10 @@ class DevProxyWindow:
         if event.widget == self.root:
             width = max(400, event.width - 48)
             self.limit_label.configure(wraplength=width)
-            self.status_label.configure(wraplength=width)
+            self.status_label.configure(wraplength=width - 140)
             self.workflow_label.configure(wraplength=width)
+            self.permanent_details_label.configure(wraplength=width - 20)
+            self.permanent_health_label.configure(wraplength=width - 20)
             if hasattr(self, "selected_path_label"):
                 self.selected_path_label.configure(wraplength=width)
             if hasattr(self, "discovery_label"):
@@ -329,6 +354,7 @@ class DevProxyWindow:
         data = StateManager.get_profile(self.profile.get()) if self.profile.get() else None
         if not data:
             self.summary.set("Прокси пока не настроен. Нажмите кнопку «Добавить», чтобы ввести адрес и порт.")
+
             return
         profile = ProxyProfile.from_dict(data)
         self.summary.set(f"{profile.protocol.upper()} • {profile.host}:{profile.port} • " +
@@ -435,13 +461,15 @@ class DevProxyWindow:
     def render_apps(self):
         self.table.delete(*self.table.get_children())
         self.rows.clear()
+        snapshot = self.background.snapshot() if self.background else {}
+        policies = {item["id"]: item for item in snapshot.get("policies", [])}
         for index, record in enumerate(self.records):
             if not isinstance(record, dict) or not isinstance(record.get("executable"), str):
                 continue
             item = str(index)
             missing = not os.path.isfile(record["executable"])
-            policies = self.background.policies() if self.background else {}
-            status = "Файл не найден" if missing else ("Постоянный режим" if record["id"] in policies else "Готово к запуску")
+            policy = policies.get(record["id"])
+            status = "Файл не найден" if missing else ("Постоянно → " + policy["profile"] if policy else "Обычный запуск")
             kind = "CLI" if record.get("id") in ("codex", "opencode", "claude", "git") else "Окно"
             self.table.insert("", "end", iid=item, values=("☑" if record.get("selected") else "☐", record.get("name", "Приложение"), kind, status, record["executable"]))
             self.rows[item] = record
@@ -730,6 +758,7 @@ class DevProxyWindow:
             except OSError:
                 self.stop()
         self.report_background_failure()
+        self.update_permanent_status()
         busy = self.worker and self.worker.is_alive()
         if not busy and not self.session:
             self.set_controls(False)
@@ -737,6 +766,84 @@ class DevProxyWindow:
             self.root.destroy()
             return
         self.root.after(100, self.poll)
+
+    def update_permanent_status(self):
+        """Show saved intent separately from bridge health; use only the IPC cache."""
+        if self.persistent_busy:
+            self.permanent_status.set("Постоянный режим: ОБНОВЛЯЕТСЯ…")
+            self.permanent_label.configure(foreground="#984800")
+            return
+        try:
+            snapshot = self.background.snapshot() if self.background else {}
+        except Exception:
+            self.permanent_status.set("Постоянный режим: СТАТУС НЕДОСТУПЕН")
+            self.permanent_details.set("Не удалось получить состояние фонового агента.")
+            self.permanent_health.set("")
+            self.permanent_label.configure(foreground="#984800")
+            return
+        if snapshot.get("loaded") is False:
+            self.permanent_status.set("Постоянный режим: " + ("СТАТУС НЕДОСТУПЕН" if snapshot.get("error") else "ПРОВЕРЯЕТСЯ…"))
+            self.permanent_details.set("Сохранённые правила пока не удалось прочитать." if snapshot.get("error") else "Фоновый агент читает сохранённые правила.")
+            self.permanent_health.set("")
+            self.permanent_label.configure(foreground="#984800")
+            self.disable_button.configure(state="disabled")
+            return
+        policies = snapshot.get("policies", [])
+        enabled = bool(snapshot.get("applications"))
+        self.permanent_status.set("Постоянный режим: " + ("ВКЛЮЧЁН" if enabled else "ВЫКЛЮЧЕН"))
+        self.permanent_label.configure(foreground="#17683b" if enabled else "#555555")
+        self.permanent_details.set(" • ".join(item["name"] + " → " + item["profile"] for item in policies)
+                                   if enabled else "Правил нет. Отметьте приложения и нажмите «Включить для выбранных».")
+        if enabled:
+            running = {item.get("profile") for item in snapshot.get("sessions", []) if item.get("running")}
+            ready = bool(policies) and all(item["profile"] in running for item in policies)
+            health = "Фоновый мост запущен" if ready else "Внимание: мост части правил не запущен"
+            health += " • автозапуск " + ("настроен" if snapshot.get("startup") else "не настроен")
+            if snapshot.get("error"):
+                health += " • Есть ошибки соединений."
+            self.permanent_health.set(health)
+            self.permanent_health_label.configure(foreground="#984800" if not ready or snapshot.get("error") else "#555555")
+        else:
+            self.permanent_health.set("«Запустить выбранные» включает прокси только для текущей сессии.")
+        self.disable_button.configure(state="normal" if enabled else "disabled")
+        # Keep row state fresh after background resume or profile rename, without
+        # rebuilding the table (and losing the user's selection).
+        by_id = {item["id"]: item for item in policies}
+        signature = tuple((item["id"], item["profile"]) for item in policies), bool(self.session), tuple(self.rows)
+        if signature == getattr(self, "_permanent_rows_signature", None):
+            return
+        self._permanent_rows_signature = signature
+        manual = {item["id"] for item in getattr(self, "_manual_records", [])} if self.session else set()
+        for item, record in self.rows.items():
+            if record["id"] in manual or not os.path.isfile(record["executable"]):
+                continue
+            policy = by_id.get(record["id"])
+            self.table.set(item, "status", "Постоянно → " + policy["profile"] if policy else "Обычный запуск")
+
+    def explain_permanent(self):
+        messagebox.showinfo("Как работает постоянный режим",
+            "DevProxy сохраняет правила для выбранных приложений и меняет их пользовательские ярлыки. "
+            "При следующем запуске через эти ярлыки приложение получает назначенный ему прокси. "
+            "Вход в Windows автоматически запускает фоновый агент DevProxy.\n\n"
+            "Список над таблицей показывает все включённые правила и прокси каждого приложения. "
+            "Галочки выбирают приложения для следующего действия; снятие галочки не отключает правило. "
+            "Выбор другого прокси в выпадающем списке тоже не меняет правило, пока вы не нажмёте «Включить для выбранных».\n\n"
+            "После изменения режима полностью закройте приложение и запустите его снова через ярлык. "
+            "Закрытие окна DevProxy скрывает его в трей; прокси продолжает работать. "
+            "Команда выхода из трея останавливает агент и управляемые приложения, но сохраняет правила.\n\n"
+            "Чтобы отключить правило, отметьте приложение и нажмите «Вернуть обычный запуск». "
+            "«Остановить» относится только к приложениям, запущенным кнопкой «Запустить выбранные», и не отменяет постоянные правила.\n\n"
+            "Прямой запуск исходного EXE и уже открытые экземпляры не перехватываются. "
+            "Приложения, игнорирующие настройки прокси, могут подключаться напрямую. "
+            "Статус «ВКЛЮЧЁН» означает наличие правил; он не подтверждает доступность всех сайтов и API.", parent=self.root)
+
+    def update_status_preview(self, *_):
+        # Keep long diagnostic/action text available without squeezing the app list.
+        first_line = self.status.get().split("\n", 1)[0]
+        self.status_preview.set(first_line[:100] + ("…" if len(first_line) > 100 else ""))
+
+    def show_status_details(self):
+        messagebox.showinfo("Состояние и подробности", self.status.get(), parent=self.root)
 
     def report_background_failure(self):
         """Surface a persistent-tunnel failure without blocking the window.
@@ -787,6 +894,8 @@ class DevProxyWindow:
             error = max(failures, key=lambda entry: entry.get("time", 0))["message"]
         # Messages are produced by describe_error and never embed credentials.
         return {"ok": True, "applications": applications, "ports": ports,
+                "policies": list(snapshot.get("policies", [])), "startup": bool(snapshot.get("startup")),
+                "rules_loaded": snapshot.get("loaded", True),
                 "error": error, "sessions": sessions, "version": __version__}
 
     def show(self):
@@ -813,7 +922,7 @@ class DevProxyWindow:
             self.status.set("Выберите прокси и отметьте приложения для постоянного запуска.")
             return
         self.permanent_work(lambda: self.background.enable(records, name),
-                            "Постоянный режим включён. Запускайте приложения обычными ярлыками; DevProxy можно закрыть в трей. Автозапуск при входе в Windows включён.")
+                            "Правила сохранены для выбранных приложений. Полностью закройте их и запустите через ярлык. DevProxy можно скрыть в трей.")
 
     def disable_permanent(self, all_apps=False):
         ids = None if all_apps else [r["id"] for r in self.records if r.get("selected")]
@@ -828,6 +937,7 @@ class DevProxyWindow:
         self.persistent_busy = True
         self.enable_button["state"] = self.disable_button["state"] = "disabled"
         self.status.set("Обновляем постоянный режим и ярлыки…")
+        self.update_permanent_status()
         def work():
             try:
                 operation()

@@ -188,6 +188,9 @@ def main(argv=None):
     profiles.add_parser("list")
     sub.add_parser("gui")
     sub.add_parser("status")
+    repair = sub.add_parser("antigravity-recovery", help="Восстановление загрузки локального интерфейса Antigravity")
+    repair.add_argument("executable", help="Полный путь к Antigravity.exe")
+    repair.add_argument("--restore", action="store_true", help="Вернуть исходный архив клиента")
     apps = sub.add_parser("apps").add_subparsers(dest="action")
     apps.add_parser("list")
     for name in ("doctor", "test"):
@@ -253,6 +256,10 @@ def main(argv=None):
             print("Backend: native/environment; WFP redirector: unavailable")
             print("Profiles:", len(StateManager.list_profiles()))
             print("Legacy recovery records:", len(StateManager.load_state().get("applied", {})))
+            return 0
+        if args.command == "antigravity-recovery":
+            from .core.antigravity_recovery import prepare
+            print(prepare(args.executable, restore=args.restore))
             return 0
         if args.command in ("doctor", "test"):
             profile = resolve_profile(args.profile, args.proxy)
