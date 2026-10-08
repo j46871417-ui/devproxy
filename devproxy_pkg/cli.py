@@ -173,6 +173,12 @@ def choose_adapter(name):
 
 
 def main(argv=None):
+    # Frozen Python does not honor PYTHONIOENCODING. Russian help/errors must
+    # also work when stdout/stderr are redirected on a Western Windows host.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="backslashreplace")
     parser = argparse.ArgumentParser(description="DevProxy Windows application proxy sessions (Phase 1)")
     parser.add_argument("--version", action="version", version="DevProxy " + __version__)
     parser.add_argument("--verbose", action="store_true")
