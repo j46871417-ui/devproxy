@@ -115,9 +115,14 @@ class ArchiveTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'изменён'): recovery.prepare(self.exe)
 
     def test_patch_failure_leaves_original_and_verified_backup(self):
+        # prepare() canonicalizes the EXE path; runner TEMP may be a junction.
+        # Force a noncanonical spelling to exercise the same case locally.
+        alias = self.archive.parent / 'alias-directory'
+        alias.mkdir()
+        self.archive = alias / '..' / self.archive.name
         atomic = recovery._atomic
         def fail_archive(path, data):
-            if path == self.archive: raise OSError('fixture atomic replace failure')
+            if path.resolve() == self.archive.resolve(): raise OSError('fixture atomic replace failure')
             return atomic(path, data)
         with patch.object(recovery, '_atomic', side_effect=fail_archive):
             with self.assertRaises(OSError): recovery.prepare(self.exe)
